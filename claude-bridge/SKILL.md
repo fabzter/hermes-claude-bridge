@@ -1,31 +1,27 @@
 ---
 name: claude-bridge
-description: "Ask Claude Code or pregúntale a Claude for a 2nd opinion."
+description: "Ask Claude Code: stronger coding expert, better opinion."
 ---
 
 # Claude Bridge (Hermes → Claude Code)
 
-**Use this when the user says any of:** "ask Claude", "ask Claude Code", "check with Claude",
-"what does Claude think/say", "second opinion", "have Claude look at this", "consult the other
-agent" — or in Spanish: "pregúntale a Claude", "qué opina Claude", "consulta con Claude",
-"segunda opinión". Also reach for it unprompted when a question needs reading real files or
-code to answer well and Claude Code is likely to have that context already.
+**Route here when the ask implies coding/engineering expertise or a deliberately stronger
+model** — not merely "another view". Triggers:
 
-> Note: Hermes truncates skill descriptions to 60 chars in its system-prompt index, so the
-> frontmatter description is deliberately short — this list is the real trigger set.
+- By name: "ask Claude", "ask Claude Code", "check with Claude", "what does Claude think",
+  "have Claude look at this" — Spanish: "pregúntale a Claude", "qué opina Claude",
+  "consulta con Claude".
+- By capability: "expert opinion", "coding expert", "a better opinion", "a stronger model/
+  agent", "deeper analysis", "someone who actually reads the code" — Spanish:
+  "opinión experta", "experto en código", "una mejor opinión", "un agente más fuerte/potente",
+  "un análisis más profundo".
+- Unprompted: when answering well requires reading real files or code, and Claude Code likely
+  already has that context.
 
-Lets Hermes hold a **continuing conversation** with Claude Code instead of firing one-shot
-prompts: the first call opens a session, later calls resume it, so follow-up questions keep
-context.
-
-Script: `scripts/claude-bridge` (in this skill's directory). Run it with `bash` so it works
-regardless of whether the executable bit survived installation:
-
-```bash
-bash ~/.hermes/skills/claude-bridge/scripts/claude-bridge ask "your question"
-```
-
-Requires the `claude` CLI on PATH (override with `CLAUDE_BIN`).
+**Do NOT claim the bare "second opinion" / "segunda opinión" slot.** That phrasing is generic
+and other agent bridges may be installed alongside this one; a request for just *another*
+viewpoint, with no hint of coding depth or wanting a stronger model, is not automatically this
+skill. When it's ambiguous, ask which agent the user wants rather than assuming.
 
 ## Commands
 
