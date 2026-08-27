@@ -1,9 +1,18 @@
 ---
 name: claude-bridge
-description: "Use when talking to Claude Code from Hermes — the user says 'ask Claude', 'check with Claude Code', 'what does Claude think', or when a question needs Claude's codebase/file reasoning. Holds a real continuing conversation (not one-shot prompts) and is read-only by design."
+description: "Ask Claude Code or pregúntale a Claude for a 2nd opinion."
 ---
 
 # Claude Bridge (Hermes → Claude Code)
+
+**Use this when the user says any of:** "ask Claude", "ask Claude Code", "check with Claude",
+"what does Claude think/say", "second opinion", "have Claude look at this", "consult the other
+agent" — or in Spanish: "pregúntale a Claude", "qué opina Claude", "consulta con Claude",
+"segunda opinión". Also reach for it unprompted when a question needs reading real files or
+code to answer well and Claude Code is likely to have that context already.
+
+> Note: Hermes truncates skill descriptions to 60 chars in its system-prompt index, so the
+> frontmatter description is deliberately short — this list is the real trigger set.
 
 Lets Hermes hold a **continuing conversation** with Claude Code instead of firing one-shot
 prompts: the first call opens a session, later calls resume it, so follow-up questions keep
