@@ -24,9 +24,9 @@ Requires the `claude` CLI on PATH (override with `CLAUDE_BIN`).
 |---|---|
 | `ask "MESSAGE"` | Ask Claude; prints Claude's reply on stdout |
 | `ask-file FILE` | Same, but the message body is a file — use for long context |
-| `session` | Print the stored Claude session id for this conversation |
-| `reset` | Forget the session id; the next `ask` starts fresh |
-| `list` | List known session names and their Claude session ids |
+| `session` | Show which Claude conversation this name is attached to |
+| `reset` | Detach from the current conversation; the next `ask` starts fresh |
+| `list` | Show all session names and the conversations they map to |
 
 Options: `--session NAME` (default `bean`) · `--timeout SECONDS` (default 300) · `--cwd DIR`
 (default `$HOME`; sets what Claude can read) · `--model NAME` · `--tools "T1 T2"`.
@@ -60,8 +60,8 @@ to approve it. This is a deliberate fail-closed boundary between the two agents.
 
 - **First call ~10-30s**; complex questions can take minutes. Raise `--timeout` rather than
   retrying — a retry restarts the work.
-- **Stale session ids self-heal**: if the stored id no longer exists, the bridge reports it,
-  drops it, and starts a fresh conversation automatically.
+- **A stale attachment self-heals**: if the conversation no longer exists, the bridge says so,
+  detaches, and starts a fresh one automatically.
 - **`--cwd` controls what Claude can read.** Point it at a specific repo when the question is
   about that repo.
 - An empty reply is treated as an error (non-zero exit + raw output), not as silence.
