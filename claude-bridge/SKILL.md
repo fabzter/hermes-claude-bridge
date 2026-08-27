@@ -23,6 +23,17 @@ and other agent bridges may be installed alongside this one; a request for just 
 viewpoint, with no hint of coding depth or wanting a stronger model, is not automatically this
 skill. When it's ambiguous, ask which agent the user wants rather than assuming.
 
+## Running it
+
+Script: `scripts/claude-bridge` (in this skill's directory). Invoke it with `bash`, because a
+hub install does not preserve the executable bit:
+
+```bash
+bash ~/.hermes/skills/claude-bridge/scripts/claude-bridge ask "your question"
+```
+
+Requires the `claude` CLI on PATH (override with `CLAUDE_BIN`).
+
 ## Commands
 
 | Command | Purpose |
