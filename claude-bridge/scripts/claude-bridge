@@ -31,6 +31,44 @@ MODEL=""
 
 err() { printf '%s\n' "$*" >&2; }
 
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Read one top-level field from a JSON file. Uses jq when present, else python3,
+# so neither is a hard requirement.
+json_get() {
+  local f="$1" k="$2"
+  if have jq; then
+    jq -r --arg k "$k" 'if type=="object" then (.[$k] // empty) else empty end' "$f" 2>/dev/null
+  elif have python3; then
+    python3 -c 'import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print(d.get(sys.argv[2],"") if isinstance(d,dict) else "")
+except Exception:
+    pass' "$f" "$k" 2>/dev/null
+  fi
+}
+
+# The Hermes skill installer copies files verbatim: it does not set the
+# executable bit and there is no post-install hook, so this script checks its
+# own requirements and fails with an actionable message rather than a confusing
+# one mid-run. (Run the script via `bash` -- the exec bit is never set.)
+preflight() {
+  local missing=""
+  [[ -n "$CLAUDE_BIN" && -x "$CLAUDE_BIN" ]] || missing="${missing}
+  - claude: the Claude Code CLI was not found on PATH (set CLAUDE_BIN to override)"
+  have uuidgen || missing="${missing}
+  - uuidgen: needed to open a new conversation id"
+  if ! have jq && ! have python3; then
+    missing="${missing}
+  - jq or python3: needed to read Claude's JSON reply"
+  fi
+  if [[ -n "$missing" ]]; then
+    err "claude-bridge: unmet requirements:${missing}"
+    exit 7
+  fi
+}
+
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
 
 is_valid_name() { [[ "$1" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; }
@@ -84,7 +122,7 @@ run_claude() {
 do_ask() {
   local message="$1"
   [[ -n "$message" ]] || { err "claude-bridge: empty message"; exit 2; }
-  [[ -n "$CLAUDE_BIN" && -x "$CLAUDE_BIN" ]] || { err "claude-bridge: 'claude' CLI not found (set CLAUDE_BIN)"; exit 7; }
+  preflight
 
   local prior; prior="$(load_id)"
   local -a args=(-p "$message" --output-format json --allowedTools $TOOLS)
@@ -124,8 +162,9 @@ do_ask() {
   fi
 
   local reply sid
-  reply="$(jq -r 'if type=="object" then (.result // .text // empty) else empty end' "$outf" 2>/dev/null || true)"
-  sid="$(jq -r 'if type=="object" then (.session_id // empty) else empty end' "$outf" 2>/dev/null || true)"
+  reply="$(json_get "$outf" result)"
+  [[ -n "$reply" ]] || reply="$(json_get "$outf" text)"
+  sid="$(json_get "$outf" session_id)"
   [[ -n "$sid" ]] && save_id "$sid" || { [[ -n "$fresh_id" ]] && save_id "$fresh_id"; }
 
   if [[ -z "$reply" ]]; then

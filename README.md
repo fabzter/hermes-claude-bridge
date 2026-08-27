@@ -27,8 +27,14 @@ Options: `--session NAME` (default `bean`), `--timeout SECONDS` (300), `--cwd DI
 `--model NAME`, `--tools "T1 T2"`. Exit codes: `0` ok, `1` error, `2` bad usage, `6` timeout,
 `7` `claude` CLI not found.
 
-Requires the `claude` CLI on `PATH` (or set `CLAUDE_BIN`). macOS/Linux, bash 3.2 compatible,
-no dependencies beyond `jq`, `uuidgen`, and coreutils.
+## Requirements
+
+Pure **bash** (3.2 compatible), macOS/Linux. Needs the `claude` CLI on `PATH` (or `CLAUDE_BIN`),
+`uuidgen`, and either `jq` or `python3` to read Claude's JSON reply. The script preflights all
+three and exits `7` naming whatever is missing.
+
+Note: Hermes's skill installer copies files verbatim — it does not set the executable bit, and
+skills have no post-install hook — so always invoke via `bash`, as shown above.
 
 ## The other direction
 

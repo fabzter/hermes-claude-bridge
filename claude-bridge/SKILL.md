@@ -1,6 +1,7 @@
 ---
 name: claude-bridge
 description: "Ask Claude Code: stronger coding expert, better opinion."
+platforms: [macos, linux]
 ---
 
 # Claude Bridge (Hermes → Claude Code)
@@ -32,7 +33,22 @@ hub install does not preserve the executable bit:
 bash ~/.hermes/skills/claude-bridge/scripts/claude-bridge ask "your question"
 ```
 
-Requires the `claude` CLI on PATH (override with `CLAUDE_BIN`).
+### Requirements
+
+The script is **bash** — there is no Python component. It needs:
+
+| Requirement | Why | If missing |
+|---|---|---|
+| `claude` CLI | the actual Claude Code binary | set `CLAUDE_BIN`, or install Claude Code |
+| `uuidgen` | opens a new conversation id | ships with macOS/util-linux |
+| `jq` **or** `python3` | reads Claude's JSON reply | either one suffices |
+
+The script preflights all of these and exits `7` with a specific message naming what is missing,
+so a broken environment fails loudly instead of halfway through.
+
+Why `bash` and not a direct call: Hermes's skill installer copies files verbatim — it does not
+set the executable bit, and skills have no post-install hook that could `chmod` for us. Invoking
+via `bash` sidesteps that entirely, which is why an install script would be pointless here.
 
 ## Commands
 
