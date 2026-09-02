@@ -6,12 +6,15 @@ export HERDR_BRIDGE_SESSION="bridge-test-$$"
 export CLAUDE_BRIDGE_STATE_DIR="$(mktemp -d)"
 B="python3 $here/claude-bridge/scripts/claude-bridge"
 STATE="$CLAUDE_BRIDGE_STATE_DIR"
+MARKER_DIR="/tmp/claude-bridge-e2e-$$"
+MARKER="$MARKER_DIR/marker"
 cleanup() { $B watch stop >/dev/null 2>&1 || true
             HERDR_SESSION="$HERDR_BRIDGE_SESSION" herdr session stop "$HERDR_BRIDGE_SESSION" --json >/dev/null 2>&1 || true
             herdr session delete "$HERDR_BRIDGE_SESSION" --json >/dev/null 2>&1 || true
             hermes webhook remove claude-bridge-e2e >/dev/null 2>&1 || true
             if [[ -f "$CLAUDE_BRIDGE_STATE_DIR/watch.log" ]]; then cp "$CLAUDE_BRIDGE_STATE_DIR/watch.log" /tmp/claude-e2e-watch.log || true; fi
-            rm -rf "$CLAUDE_BRIDGE_STATE_DIR"; }
+            rm -rf "$CLAUDE_BRIDGE_STATE_DIR"
+            rm -rf "$MARKER_DIR"; }
 trap cleanup EXIT
 echo "## webhook route (log delivery)"; $B setup-webhook --route claude-bridge-e2e --deliver log
 echo "## watcher"; $B watch start; $B watch status
@@ -33,7 +36,10 @@ echo "confirmed: Bash denied without prompting, command did not run"
 echo "## open e2e2 in default mode (Bash is NOT denied here, so it must prompt for approval)"
 $B open e2e2 --cwd "$here" --fresh
 echo "## approval"; set +e
-$B ask e2e2 "Run the shell command: echo hello-from-e2e" > /tmp/e2e-claude-approval.out 2>&1; rc=$?; set -e; cat /tmp/e2e-claude-approval.out
+# A bare `echo` is auto-approved by Claude Code 2.1.236 even under --permission-mode manual (no
+# allow rule needed — it's built-in safe-command behavior), so it never actually prompts. Use a
+# side-effecting command (mkdir + touch a marker file) that Claude Code cannot wave through.
+$B ask e2e2 "Run this exact shell command and nothing else: mkdir -p $MARKER_DIR && touch $MARKER" > /tmp/e2e-claude-approval.out 2>&1; rc=$?; set -e; cat /tmp/e2e-claude-approval.out
 if [[ $rc == 3 ]]; then
   echo "approval detected"
   st=$($B state e2e2); echo "state=$st"
@@ -41,8 +47,9 @@ if [[ $rc == 3 ]]; then
   echo "## deny via esc"; $B keys e2e2 esc; sleep 2
   st2=$($B state e2e2); echo "state=$st2"
   [[ $st2 != approval ]] || { echo "FAIL: e2e2 still in 'approval' after esc"; exit 1; }
+  [[ ! -e "$MARKER" ]] || { echo "FAIL: marker file exists — command ran despite being dismissed via esc"; exit 1; }
 else
-  echo "FAIL: rc=$rc — expected exit 3 (approval); default mode must prompt for Bash, not skip or auto-run it"; exit 1
+  echo "FAIL: rc=$rc — expected exit 3 (approval); default mode must prompt for a side-effecting shell command, not skip or auto-run it"; exit 1
 fi
 echo "## watcher log (expect a posted line)"; sleep 3; tail -5 "$STATE/watch.log" || true
 echo "## list (both sessions coexist)"; $B list

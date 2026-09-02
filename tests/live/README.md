@@ -18,6 +18,8 @@ trap:
 - copies `$CLAUDE_BRIDGE_STATE_DIR/watch.log` to `/tmp/claude-e2e-watch.log` (if it exists) so
   the watcher's log survives for inspection
 - deletes the throwaway `CLAUDE_BRIDGE_STATE_DIR` directory entirely (`rm -rf`)
+- deletes the throwaway `/tmp/claude-bridge-e2e-$$` marker directory (step 6 below) entirely
+  (`rm -rf`)
 
 ## What it does
 
@@ -37,10 +39,15 @@ trap:
    text back and would otherwise false-positive.
 6. Opens a second session (`e2e2`) in **default** mode — no `--read-only` — to confirm the
    *other* half of the permission story: here `Bash` is not denied, so `--permission-mode
-   manual` must make Claude Code prompt for it. Asks it to run the same shell command; the
-   script asserts exit code `3` (`approval`) and that `state e2e2` reads `approval`, **fails
-   the run if either is anything else**, then dismisses the prompt with `esc` (never
-   approves it) and asserts `state e2e2` has left `approval`.
+   manual` must make Claude Code prompt for it. Asks it to `mkdir -p` a throwaway directory and
+   `touch` a marker file inside it (**not** the bare `echo` used in step 5) — Claude Code
+   2.1.236 auto-approves a plain `echo` even under `--permission-mode manual` (there's no allow
+   rule for it; it's built-in safe-command behavior that skips the prompt entirely), so a
+   side-effecting command is required to actually exercise the approval gate. The script
+   asserts exit code `3` (`approval`) and that `state e2e2` reads `approval`, **fails the run
+   if either is anything else**, then dismisses the prompt with `esc` (never approves it),
+   asserts `state e2e2` has left `approval`, and asserts the marker file was **not** created
+   (proving the dismissed command never ran).
 7. Tails the throwaway `$CLAUDE_BRIDGE_STATE_DIR/watch.log` to show the watcher's forwarded
    event(s), lists both sessions to confirm they coexist, then closes both and runs `gc`.
 
