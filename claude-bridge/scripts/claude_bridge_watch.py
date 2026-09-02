@@ -16,6 +16,11 @@ import claude_bridge_webhook as wh
 # process.
 _popen = subprocess.Popen
 
+# Indirected the same way as `_popen`: tests replace `w._dup2` with a recorder so the fd-1/2
+# redirect after log rotation (see `_maybe_rotate_log`) doesn't clobber the test runner's own
+# stdout/stderr.
+_dup2 = os.dup2
+
 
 def should_forward(prev: str | None, new: str) -> bool:
     if new == "blocked":
@@ -60,6 +65,16 @@ class Watcher:
             except Exception:
                 pass
             self.log = open(self.log_path, "a")
+            # The watcher process's own stdout/stderr (fds 1 and 2) are still pointed at the
+            # pre-rotation file (they were inherited from `command("start")`'s spawn, or from the
+            # shell in `command("run")`). Redirect them to the freshly reopened log too, so an
+            # uncaught traceback printed after rotation lands in the fresh `watch.log` instead of
+            # the renamed `watch.log.1`. Best-effort: never let this break the watcher.
+            try:
+                _dup2(self.log.fileno(), 1)
+                _dup2(self.log.fileno(), 2)
+            except Exception:
+                pass
 
     def subscriptions(self) -> list:
         subs = [{"type": "pane.agent_status_changed", "pane_id": p["pane_id"]} for p in self.b.panes()]

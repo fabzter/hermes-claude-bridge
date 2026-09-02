@@ -1,4 +1,4 @@
-import io, os, sys, tempfile, unittest
+import functools, io, os, sys, tempfile, unittest
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "claude-bridge", "scripts"))
 import herdrbridge as hb
@@ -217,6 +217,67 @@ class WatcherLogRotationTests(unittest.TestCase):
         finally:
             hb.rotate_log = orig
         self.assertEqual(calls, [log_path])
+
+
+class WatcherOwnedLogReopenTests(unittest.TestCase):
+    def test_watcher_reopens_owned_log_after_rotation_and_redirects_fds(self):
+        d = tempfile.mkdtemp()
+        log_path = os.path.join(d, "watch.log")
+        # Pre-fill the log above the (patched-small) rotation threshold, so the 500th handle()
+        # call triggers a real rotation.
+        with open(log_path, "wb") as f:
+            f.write(b"x" * 5000)
+
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "pane list": [ok("pane_list", panes=[{"pane_id": "w2:p1", "tab_id": "w2:t1"}])],
+                       "agent list": [ok("agent_list", agents=[cagent(status="blocked")])],
+                       "agent explain": [{"matched_rule": {"id": "bash_permission_prompt"}}]},
+                      {"agent read": ["Do you want to proceed?\n❯ 1. Yes\n"]})
+        b = hb.Bridge(h, cli.CLAUDE_CFG, hb.StateStore(tempfile.mkdtemp()))
+        cfg = wh.WebhookConfig("claude-bridge", "k", "http://127.0.0.1:8644/webhooks/claude-bridge")
+
+        # No `log=` override: the watcher opens and owns `log_path` itself, exactly like the
+        # `watch run` path (`command("run")`) does.
+        watcher = w.Watcher(b, cfg, poster=lambda c, p: 200, log_path=log_path)
+
+        dup2_calls = []
+        orig_dup2 = w._dup2
+        w._dup2 = lambda fd, target: dup2_calls.append((fd, target))
+
+        orig_rotate = hb.rotate_log
+        hb.rotate_log = functools.partial(hb.rotate_log, max_bytes=10)
+
+        created = {"event": "pane.created", "data": {"pane_id": "w2:p9", "workspace_id": "w2"}}
+        blocked = {"event": "pane.agent_status_changed",
+                   "data": {"pane_id": "w2:p1", "workspace_id": "w2", "agent_status": "blocked"}}
+        try:
+            for _ in range(499):
+                watcher.handle(created)  # no-op events: bump the counter without logging anything
+            payload = watcher.handle(blocked)  # 500th call: rotates+reopens, THEN logs this event
+        finally:
+            hb.rotate_log = orig_rotate
+            w._dup2 = orig_dup2
+
+        rotated_path = log_path + ".1"
+        self.assertTrue(os.path.exists(rotated_path))
+        self.assertEqual(os.path.getsize(rotated_path), 5000)
+        self.assertIsNotNone(payload)
+
+        watcher.log.flush()
+        with open(log_path) as f:
+            fresh_content = f.read()
+        self.assertIn("posted", fresh_content)
+        self.assertIn("cv", fresh_content)
+
+        with open(rotated_path, "rb") as f:
+            rotated_content = f.read()
+        self.assertNotIn(b"posted", rotated_content)
+
+        # fds 1 and 2 were redirected to the freshly reopened handle (recorded, never actually
+        # dup2'd, so the test runner's own stdout/stderr are untouched).
+        self.assertEqual(len(dup2_calls), 2)
+        self.assertEqual({target for _, target in dup2_calls}, {1, 2})
+        self.assertEqual({fd for fd, _ in dup2_calls}, {watcher.log.fileno()})
 
 
 if __name__ == "__main__":
