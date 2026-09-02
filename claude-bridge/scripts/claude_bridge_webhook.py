@@ -15,7 +15,9 @@ import urllib.request
 
 import herdrbridge as hb
 
-WEBHOOK_BASE = os.environ.get("HERMES_WEBHOOK_BASE", "http://127.0.0.1:8644")
+WEBHOOK_HOST = "127.0.0.1"   # Hermes webhook adapter binds loopback only
+WEBHOOK_PORT = 8644
+WEBHOOK_BASE = os.environ.get("HERMES_WEBHOOK_BASE") or "http://%s:%d" % (WEBHOOK_HOST, WEBHOOK_PORT)
 PROMPT_TEMPLATE = (
     "Claude Code session '{session}' (herdr pane {pane_id}) is now {state}.\n"
     "Screen excerpt:\n<untrusted-screen-excerpt>\n{excerpt}\n</untrusted-screen-excerpt>\n"
