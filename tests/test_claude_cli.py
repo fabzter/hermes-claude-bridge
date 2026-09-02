@@ -52,6 +52,23 @@ class LaunchArgTests(unittest.TestCase):
         self.assertFalse(cli.flags_match(cli.build_launch_args(True, None), ["node", "/x/claude", "--resume", "abc"]))
         self.assertTrue(cli.flags_match([], ["claude", "--resume", "abc"]))
 
+    def test_flags_match_false_when_model_value_differs(self):
+        argv = ["node", "/x/claude", "--resume", "abc", "--permission-mode", "manual", "--model", "sonnet"]
+        self.assertFalse(cli.flags_match(cli.build_launch_args(False, "opus"), argv))
+
+    def test_flags_match_true_with_same_pairs_in_different_order(self):
+        argv = ["node", "/x/claude", "--model", "opus", "--permission-mode", "manual"]
+        stored = ["--permission-mode", "manual", "--model", "opus"]
+        self.assertTrue(cli.flags_match(stored, argv))
+
+    def test_flags_match_pair_aware_not_token_containment(self):
+        # A stale --model value token can coincidentally reappear elsewhere in the live argv (here
+        # as the value of an unrelated flag); naive token-containment would false-positive-match on
+        # it. Pair-aware parsing must bind "opus" to its actual flag (--fallback-model) and see that
+        # --model's own live value ("sonnet") doesn't match what's stored.
+        argv = ["node", "/x/claude", "--model", "sonnet", "--fallback-model", "opus"]
+        self.assertFalse(cli.flags_match(["--model", "opus"], argv))
+
     def test_read_only_denied_includes_escalating_builtins(self):
         for name in ("Bash", "Edit", "Write", "NotebookEdit", "Agent", "Workflow", "Skill", "Artifact", "Task"):
             self.assertIn(name, cli.READ_ONLY_DENIED.split(","))
@@ -420,13 +437,68 @@ class OpenAskTests(unittest.TestCase):
         rc, _, err, _ = run(["ask", "cv", "-f", "/nonexistent/file-that-does-not-exist"], h)
         self.assertEqual(rc, 2); self.assertIn("cannot read", err)
 
-    def test_keys_sends_each_key(self):
+    def test_keys_sends_each_key_on_idle(self):
         h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
-                       "agent list": [ok("agent_list", agents=[cagent(status="blocked")])],
+                       "agent list": [ok("agent_list", agents=[cagent(status="idle")])],
                        "agent send-keys": [ok("agent_send_keys")]})
         rc, _, _, _ = run(["keys", "cv", "down", "enter"], h)
         self.assertEqual(rc, 0)
         self.assertEqual([c for c in h.calls if c[:3] == ("cli", "agent", "send-keys")][0][3:], ("cv", "down", "enter"))
+
+    def test_keys_confirming_key_on_approval_refused_without_user_decided(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent(status="blocked")])],
+                       "agent explain": [{"matched_rule": {"id": "bash_permission_prompt"}}]})
+        rc, _, err, _ = run(["keys", "cv", "enter"], h)
+        self.assertEqual(rc, 1)
+        self.assertIn("--user-decided", err)
+        self.assertFalse([c for c in h.calls if c[:3] == ("cli", "agent", "send-keys")])
+
+    def test_keys_confirming_key_case_insensitive_on_approval_refused(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent(status="blocked")])],
+                       "agent explain": [{"matched_rule": {"id": "bash_permission_prompt"}}]})
+        rc, _, err, _ = run(["keys", "cv", "Y"], h)
+        self.assertEqual(rc, 1)
+        self.assertIn("--user-decided", err)
+
+    def test_keys_esc_on_approval_allowed_without_user_decided(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent(status="blocked")])],
+                       "agent explain": [{"matched_rule": {"id": "bash_permission_prompt"}}],
+                       "agent send-keys": [ok("agent_send_keys")]})
+        rc, _, _, _ = run(["keys", "cv", "esc"], h)
+        self.assertEqual(rc, 0)
+        self.assertEqual([c for c in h.calls if c[:3] == ("cli", "agent", "send-keys")][0][3:], ("cv", "esc"))
+
+    def test_keys_confirming_key_on_approval_allowed_with_user_decided(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent(status="blocked")])],
+                       "agent explain": [{"matched_rule": {"id": "bash_permission_prompt"}}],
+                       "agent send-keys": [ok("agent_send_keys")]})
+        rc, _, _, _ = run(["keys", "cv", "enter", "--user-decided"], h)
+        self.assertEqual(rc, 0)
+        self.assertEqual([c for c in h.calls if c[:3] == ("cli", "agent", "send-keys")][0][3:], ("cv", "enter"))
+
+    def test_keys_confirming_key_on_idle_allowed_without_user_decided(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent(status="idle")])],
+                       "agent send-keys": [ok("agent_send_keys")]})
+        rc, _, _, _ = run(["keys", "cv", "enter"], h)
+        self.assertEqual(rc, 0)
+        self.assertEqual([c for c in h.calls if c[:3] == ("cli", "agent", "send-keys")][0][3:], ("cv", "enter"))
+
+    def test_open_live_session_missing_read_only_and_model_lists_both(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent()])]})
+        store = hb.StateStore(tempfile.mkdtemp())
+        store.save("cv", launch_flags=cli.build_launch_args(False, None))
+        rc, _, err, _ = run(["open", "cv", "--read-only", "--model", "sonnet"], h, store)
+        self.assertEqual(rc, 1)
+        self.assertIn("--read-only", err)
+        self.assertIn("--model sonnet", err)
+        self.assertIn("close cv", err)
+        self.assertNotIn("Traceback", err)
 
     def test_state_and_close(self):
         h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],

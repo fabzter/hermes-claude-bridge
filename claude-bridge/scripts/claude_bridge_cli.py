@@ -21,6 +21,13 @@ READ_ONLY_DENIED = "Bash,Edit,Write,NotebookEdit,Agent,Workflow,Skill,Artifact,T
 # --disallowedTools (observed live: a read-only session still had a Bash-capable MCP tool).
 # --strict-mcp-config + an empty --mcp-config JSON blob disables all of them for read-only sessions.
 READ_ONLY_MCP = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+# Keys that could confirm/dismiss a prompt (a bare Enter/Return submits the highlighted choice; a
+# digit or "y" picks a numbered/yes-no option) -- these require --user-decided while a prompt is
+# open, so the human in chat is the one who decided, not an agent guessing at raw keystrokes.
+# esc and the arrow keys are never in here, so they always pass through unconditionally.
+CONFIRMING_KEYS = {"enter", "return", "y", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
+# session states in which a prompt might be open and awaiting a human decision.
+_KEYS_GATED_STATES = {"approval", "secret", "clarify", "blocked"}
 CLAUDE_CFG = hb.BridgeConfig(workspace_label="claude-bridge", kind="claude",
                              default_cwd=os.path.expanduser("~"), exit_command="/exit")
 
@@ -43,10 +50,6 @@ def build_launch_args(read_only: bool, model: str | None, permission_mode: str =
     if model:
         args += ["--model", model]
     return args
-
-
-def flags_match(stored_flags: list, argv: list) -> bool:
-    return all(tok in argv for tok in stored_flags)
 
 
 def live_argv(bridge: hb.Bridge, pane_id: str) -> list:
@@ -98,19 +101,65 @@ def merge_launch_args(stored: list, requested: list) -> list:
     return out
 
 
-def _is_read_only_flags(flags: list) -> bool:
+def _is_read_only_flags(flags) -> bool:
     return "--allowedTools" in flags
+
+
+def _find_claude_argv_tail(argv: list) -> list:
+    """The launch-arg tokens actually passed to `claude`: everything after the argv entry whose
+    basename is the `claude` executable itself (e.g. ["node", "/x/claude", "--resume", "C1",
+    "--model", "opus"] -> ["--resume", "C1", "--model", "opus"]). Falls back to the whole argv
+    when no such entry is found, rather than matching nothing."""
+    idx = next((i for i, tok in enumerate(argv) if os.path.basename(str(tok)) == "claude"), None)
+    return list(argv[idx + 1:]) if idx is not None else list(argv)
+
+
+def _missing_pairs(stored_flags: list, argv: list) -> dict:
+    """Stored (flag, value) launch-arg pairs that are absent, or present with a different value,
+    in argv's live launch tail -- pair-aware (a stored --model only counts as missing when the
+    live value actually differs) and order-insensitive (both sides are parsed into dicts)."""
+    live_pairs = _parse_launch_pairs(_find_claude_argv_tail(argv))
+    return {flag: value for flag, value in _parse_launch_pairs(stored_flags).items()
+            if live_pairs.get(flag, _MISSING) != value}
+
+
+def flags_match(stored_flags: list, argv: list) -> bool:
+    return not _missing_pairs(stored_flags, argv)
+
+
+def _remediation_suffix(missing_pairs: dict) -> str:
+    """Map missing/mismatched launch-arg (flag, value) pairs back to the user-facing CLI flags a
+    caller would actually type, so the remediation hint lists everything that needs restating: the
+    read-only-related flags (--allowedTools/--disallowedTools/--strict-mcp-config/--mcp-config)
+    collapse to a single --read-only, --model keeps its value, and --permission-mode maps to
+    --yolo for bypassPermissions or is passed through for any other non-manual value. A missing
+    --permission-mode manual needs no remediation -- it's build_launch_args's own ambient default,
+    not something the caller must ask for again."""
+    tokens = []
+    if _is_read_only_flags(missing_pairs):
+        tokens.append("--read-only")
+    if "--model" in missing_pairs:
+        tokens += ["--model", missing_pairs["--model"]]
+    if "--permission-mode" in missing_pairs:
+        mode = missing_pairs["--permission-mode"]
+        if mode == "bypassPermissions":
+            tokens.append("--yolo")
+        elif mode and mode != "manual":
+            tokens += ["--permission-mode", mode]
+    return (" " + " ".join(tokens)) if tokens else ""
 
 
 def check_flags(bridge: hb.Bridge, name: str, agent: dict) -> None:
     stored = bridge.store.load(name).get("launch_flags") or []
-    if stored and not flags_match(stored, live_argv(bridge, agent["pane_id"])):
-        suffix = " --read-only" if _is_read_only_flags(stored) else ""
+    if not stored:
+        return
+    missing = _missing_pairs(stored, live_argv(bridge, agent["pane_id"]))
+    if missing:
         raise hb.BridgeError(
             "session %r is running without its requested flags (%s) — herdr's restore likely "
             "relaunched it as plain `claude --resume`, dropping every flag we set (including the "
             "pinned permission mode). Run `close %s` then `open %s%s` to restore them."
-            % (name, " ".join(stored), name, name, suffix), hb.EXIT_ERROR)
+            % (name, " ".join(stored), name, name, _remediation_suffix(missing)), hb.EXIT_ERROR)
 
 
 def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, model: str | None, fresh: bool,
@@ -132,29 +181,23 @@ def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, 
             # only an explicit, different mode should trigger the close/open remediation below.
             del requested_pairs["--permission-mode"]
         stored_pairs = _parse_launch_pairs(stored)
-        missing_flags = [flag for flag, _ in _LAUNCH_FLAG_ORDER
+        missing_pairs = {flag: requested_pairs[flag] for flag, _ in _LAUNCH_FLAG_ORDER
                           if flag in requested_pairs
-                          and stored_pairs.get(flag, _MISSING) != requested_pairs[flag]]
-        if missing_flags:
+                          and stored_pairs.get(flag, _MISSING) != requested_pairs[flag]}
+        if missing_pairs:
             missing_tokens = []
-            for flag in missing_flags:
-                missing_tokens.append(flag)
-                if requested_pairs[flag] is not None:
-                    missing_tokens.append(requested_pairs[flag])
-            if set(missing_flags) <= {"--permission-mode"}:
-                # Nothing the caller actually asked for is missing — only the always-pinned
-                # permission-mode pair (e.g. a session predating this pin, or one that lost it
-                # to a herdr restore). Don't imply --read-only/--model were requested when
-                # they weren't: that path can't build a remediation flag anyway (`model` may be
-                # None) and it isn't what the caller is missing.
-                suffix = ""
-            elif read_only:
-                suffix = " --read-only"
-            else:
-                suffix = " --model " + model
+            for flag, _ in _LAUNCH_FLAG_ORDER:
+                if flag in missing_pairs:
+                    missing_tokens.append(flag)
+                    if missing_pairs[flag] is not None:
+                        missing_tokens.append(missing_pairs[flag])
+            # _remediation_suffix already omits a bare --permission-mode manual (build_launch_args's
+            # own ambient default, not something the caller asked for) and lists every other missing
+            # flag/value pair the caller would actually have to restate.
             raise hb.BridgeError(
                 "session %r is already running without the requested flags (%s); run `close %s` then "
-                "`open %s%s` to apply them" % (name, " ".join(missing_tokens), name, name, suffix), hb.EXIT_ERROR)
+                "`open %s%s` to apply them" % (name, " ".join(missing_tokens), name, name,
+                                                _remediation_suffix(missing_pairs)), hb.EXIT_ERROR)
         agent = bridge.start(name, [], fresh=False, cwd=cwd)
     else:
         # The session isn't live (e.g. the agent process died, or herdr restored it as plain
@@ -214,6 +257,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("text")
     sp = named("keys", "send raw keys to Claude's UI (only when the user explicitly decided)")
     sp.add_argument("keys", nargs="+")
+    sp.add_argument("--user-decided", action="store_true",
+                     help="required to send a key that could confirm/dismiss a prompt (enter, a "
+                          "digit, y) while a prompt is open (approval/secret/clarify/blocked) — "
+                          "only pass this when the user has actually decided in chat; esc and the "
+                          "arrow keys never need it")
     named("session", "print the Claude session id")
     named("close", "send /exit and close the tab (conversation stays resumable)")
     named("forget", "delete the stored session record")
@@ -310,9 +358,14 @@ def main(argv=None, bridge_factory=None, stdout=None, stderr=None) -> int:
         if args.cmd == "answer":
             st = b.answer(name, args.text); out.write(st + "\n"); return 0 if st == "busy" else hb.state_exit(st)
         if args.cmd == "keys":
-            a = b.find_agent(name)
+            state, a = b.state(name)
             if not a:
                 raise hb.BridgeError("no live Claude session %r" % name, hb.EXIT_MISSING)
+            confirming = any(k.lower() in CONFIRMING_KEYS for k in args.keys)
+            if state in _KEYS_GATED_STATES and confirming and not args.user_decided:
+                raise hb.BridgeError(
+                    "keys that could confirm a prompt require --user-decided (the user must have "
+                    "decided in chat)", hb.EXIT_ERROR)
             b.h.cli("agent", "send-keys", name, *args.keys)
             out.write("sent %s\n" % " ".join(args.keys)); return 0
         if args.cmd == "session":
