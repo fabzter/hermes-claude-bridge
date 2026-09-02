@@ -75,6 +75,21 @@ class WatcherTests(unittest.TestCase):
         watcher.handle({"event": "pane.agent_status_changed", "data": {"pane_id": "w1:p1", "workspace_id": "w1", "agent_status": "blocked"}})
         self.assertEqual(posted, [])
 
+    def test_poster_error_status_logged_as_failed(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "pane list": [ok("pane_list", panes=[{"pane_id": "w2:p1", "tab_id": "w2:t1"}])],
+                       "agent list": [ok("agent_list", agents=[cagent(status="blocked")])],
+                       "agent explain": [{"matched_rule": {"id": "bash_permission_prompt"}}]},
+                      {"agent read": ["Do you want to proceed?\n❯ 1. Yes\n"]})
+        b = hb.Bridge(h, cli.CLAUDE_CFG, hb.StateStore(tempfile.mkdtemp()))
+        cfg = wh.WebhookConfig("claude-bridge", "k", "http://127.0.0.1:8644/webhooks/claude-bridge")
+        log = io.StringIO()
+        watcher = w.Watcher(b, cfg, poster=lambda c, p: 401, log=log)
+        env = {"event": "pane.agent_status_changed", "data": {"pane_id": "w2:p1", "workspace_id": "w2", "agent_status": "blocked"}}
+        watcher.handle(env)
+        self.assertIn("FAILED", log.getvalue())
+        self.assertIn("401", log.getvalue())
+
 
 class PidfileTests(unittest.TestCase):
     def test_status_without_pidfile(self):
@@ -85,6 +100,18 @@ class PidfileTests(unittest.TestCase):
     def test_stop_without_pidfile(self):
         out, err = io.StringIO(), io.StringIO()
         self.assertEqual(w.command("stop", tempfile.mkdtemp(), lambda: None, out, err), 0)
+
+    def test_running_pid_none_for_dead_pid(self):
+        d = tempfile.mkdtemp()
+        with open(w._pidfile(d), "w") as f:
+            f.write("999999")
+        self.assertIsNone(w._running_pid(d))
+
+    def test_running_pid_none_for_garbage_content(self):
+        d = tempfile.mkdtemp()
+        with open(w._pidfile(d), "w") as f:
+            f.write("not-a-pid")
+        self.assertIsNone(w._running_pid(d))
 
 
 if __name__ == "__main__":

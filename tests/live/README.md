@@ -4,15 +4,18 @@
 Claude Code agent-detection manifest installed), real `claude` (Claude Code CLI) on
 `PATH`, and the real Hermes gateway webhook adapter listening on `127.0.0.1:8644`.
 
-It does **not** touch the herdr `default` or `agents` sessions. It creates its own
-throwaway herdr session named `bridge-test-$$` (the script's own PID, so concurrent runs
-don't collide), drives two named Claude panes (`e2e`, `e2e2`) inside it, and tears
-everything down in an `EXIT` trap:
+It does **not** touch the herdr `default` or `agents` sessions, nor the project's own
+`claude-bridge/state/` directory. It creates its own throwaway herdr session named
+`bridge-test-$$` (the script's own PID, so concurrent runs don't collide) and its own
+throwaway state directory (`CLAUDE_BRIDGE_STATE_DIR`, a fresh `mktemp -d`, so it never reads
+or writes the real `claude-bridge/state/webhook.json` / `watch.pid` / `watch.log`), drives
+two named Claude panes (`e2e`, `e2e2`) inside it, and tears everything down in an `EXIT`
+trap:
 
 - stops the `claude-bridge` watcher it started (`watch stop`)
 - stops and deletes the throwaway herdr session
 - removes the `claude-bridge-e2e` Hermes webhook route (`hermes webhook remove`)
-- deletes `claude-bridge/state/webhook.json`
+- deletes the throwaway `CLAUDE_BRIDGE_STATE_DIR` directory entirely (`rm -rf`)
 
 ## What it does
 
@@ -24,11 +27,12 @@ everything down in an `EXIT` trap:
    `README.md` and answer in one sentence — a real turn through real Claude Code.
 4. Prints the Claude session id and captures a transcript (`read e2e -n 120`) to
    `/tmp/claude_live_capture.txt` — this becomes the new `tests/fixtures/claude_reply.txt`.
-5. Asks Claude to run a shell command. Bash is disallowed in read-only mode, so this
-   either produces an `approval` state (exit 3) that the script dismisses with `esc`
-   (never approves it), or Claude/the tool gate declines it outright — either outcome
-   is recorded, not treated as a failure.
-6. Tails `claude-bridge/state/watch.log` to show the watcher's forwarded event(s).
+5. Asks Claude to run a shell command. Bash is disallowed in read-only mode and
+   `--permission-mode manual` is always pinned, so Claude Code must prompt for it — the
+   script asserts exit code `3` (`approval`) and **fails the run if it is anything else**,
+   then dismisses the prompt with `esc` (never approves it).
+6. Tails the throwaway `$CLAUDE_BRIDGE_STATE_DIR/watch.log` to show the watcher's forwarded
+   event(s).
 7. Opens a second parallel session (`e2e2`) to confirm multiple named sessions coexist,
    then closes both sessions and runs `gc`.
 

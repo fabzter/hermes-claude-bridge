@@ -9,9 +9,16 @@ import sys
 import herdrbridge as hb
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATE_DIR = os.path.join(SKILL_DIR, "state")
+STATE_DIR = os.environ.get("CLAUDE_BRIDGE_STATE_DIR") or os.path.join(SKILL_DIR, "state")
+# Always pin the permission mode explicitly (rather than relying on Claude's default) so it is
+# recorded in launch_flags and check_flags can notice its loss after a herdr restore (herdr
+# relaunches with plain `claude --resume <id>`, dropping every flag we passed).
+PERMISSION_MODE_ARGS = ["--permission-mode", "manual"]
 READ_ONLY_ALLOWED = "Read,Grep,Glob,WebSearch,WebFetch"
-READ_ONLY_DENIED = "Bash,Edit,Write,NotebookEdit"
+# Bash/Edit/Write/NotebookEdit are the obvious file/shell escapes; Agent/Workflow/Skill/Artifact
+# are built-in tools that can themselves invoke further tools (including Bash-equivalents), so
+# read-only must deny them too.
+READ_ONLY_DENIED = "Bash,Edit,Write,NotebookEdit,Agent,Workflow,Skill,Artifact"
 # MCP servers configured in the user's Claude settings load regardless of --allowedTools/
 # --disallowedTools (observed live: a read-only session still had a Bash-capable MCP tool).
 # --strict-mcp-config + an empty --mcp-config JSON blob disables all of them for read-only sessions.
@@ -29,7 +36,7 @@ def default_bridge_factory():
 
 
 def build_launch_args(read_only: bool, model: str | None) -> list:
-    args = []
+    args = list(PERMISSION_MODE_ARGS)
     if read_only:
         args += ["--allowedTools", READ_ONLY_ALLOWED, "--disallowedTools", READ_ONLY_DENIED] + READ_ONLY_MCP
     if model:
@@ -71,11 +78,16 @@ def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, 
                 hb.EXIT_ERROR)
         agent = bridge.start(name, [], fresh=False, cwd=cwd)
     else:
-        flags = build_launch_args(read_only, model)
-        if not flags:
-            st = bridge.store.load(name)
-            if st.get("launch_flags"):
-                flags = list(st["launch_flags"])
+        # The session isn't live (e.g. the agent process died, or herdr restored it as plain
+        # `claude --resume` without our flags). UNION the newly requested tokens with whatever
+        # was stored before, so a caller who only passes --model doesn't silently drop
+        # previously-requested --read-only limits.
+        requested = build_launch_args(read_only, model)
+        stored = bridge.store.load(name).get("launch_flags") or []
+        flags = list(stored)
+        for tok in requested:
+            if tok not in flags:
+                flags.append(tok)
         agent = bridge.start(name, flags, fresh=fresh, cwd=cwd)
         bridge.store.save(name, launch_flags=flags)
     check_flags(bridge, name, agent)

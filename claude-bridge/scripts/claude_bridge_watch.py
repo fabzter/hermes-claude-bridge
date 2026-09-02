@@ -11,8 +11,6 @@ import time
 import herdrbridge as hb
 import claude_bridge_webhook as wh
 
-FORWARD_STATES = ("approval", "secret", "clarify", "blocked", "idle")
-
 
 def should_forward(prev: str | None, new: str) -> bool:
     if new == "blocked":
@@ -70,7 +68,11 @@ class Watcher:
         payload = wh.build_payload(name, pane_id, state, excerpt)
         try:
             status = self.poster(self.cfg, payload)
-            self._log("posted %s for %s (%s) -> HTTP %s" % (payload["event_type"], name, state, status))
+            if status >= 300:
+                self._log("WARN post FAILED for %s (%s) -> HTTP %s — re-run setup-webhook and restart the watcher"
+                           % (name, state, status))
+            else:
+                self._log("posted %s for %s (%s) -> HTTP %s" % (payload["event_type"], name, state, status))
         except Exception as e:  # network errors must not kill the watcher
             self._log("post failed for %s: %s" % (name, e))
         return payload
@@ -103,13 +105,12 @@ def _pidfile(state_dir: str) -> str:
 
 def _running_pid(state_dir: str) -> int | None:
     p = _pidfile(state_dir)
-    if not os.path.exists(p):
-        return None
     try:
-        pid = int(open(p).read().strip())
+        with open(p) as f:
+            pid = int(f.read().strip())
         os.kill(pid, 0)
         return pid
-    except (ValueError, ProcessLookupError, PermissionError):
+    except (OSError, ValueError):
         return None
 
 
