@@ -45,7 +45,7 @@ class LaunchArgTests(unittest.TestCase):
         self.assertTrue(cli.flags_match([], ["claude", "--resume", "abc"]))
 
     def test_read_only_denied_includes_escalating_builtins(self):
-        for name in ("Bash", "Edit", "Write", "NotebookEdit", "Agent", "Workflow", "Skill", "Artifact"):
+        for name in ("Bash", "Edit", "Write", "NotebookEdit", "Agent", "Workflow", "Skill", "Artifact", "Task"):
             self.assertIn(name, cli.READ_ONLY_DENIED.split(","))
 
 
@@ -117,6 +117,26 @@ class OpenAskTests(unittest.TestCase):
         self.assertIn("opus", argv_sent)
         self.assertEqual(store.load("ro")["launch_flags"], flags_final)
 
+    def test_open_after_restart_replaces_model_value_without_duplicating(self):
+        stored_flags = ["--permission-mode", "manual", "--model", "opus"]
+        flags_final = ["--permission-mode", "manual", "--model", "sonnet"]
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[]), ok("agent_list", agents=[]), ok("agent_list", agents=[cagent(session="C3")])],
+                       "tab create": [ok("tab_created", tab={"tab_id": "w2:t1"}, root_pane={"pane_id": "w2:p1"})],
+                       "agent start": [ok("agent_started", agent=cagent(session="C3"))],
+                       "pane get": [ok("pane_info", pane={"pane_id": "w2:p1"})],
+                       "pane process-info": [READY_SHELL,
+                           ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude"] + flags_final}]})]})
+        store = hb.StateStore(tempfile.mkdtemp())
+        store.save("cv", launch_flags=stored_flags)
+        rc, out, _, store = run(["open", "cv", "--model", "sonnet"], h, store)
+        self.assertEqual(rc, 0)
+        start = [c for c in h.calls if c[:3] == ("cli", "agent", "start")][0]
+        argv_sent = start[start.index("--") + 1:]
+        self.assertEqual(argv_sent.count("--model"), 1)
+        self.assertEqual(argv_sent, tuple(flags_final))
+        self.assertEqual(store.load("cv")["launch_flags"], flags_final)
+
     def test_ask_auto_opens_then_prompts(self):
         after = "> hello\n\n⏺ hi there\n\n╭──╮\n│ ❯ │\n╰──╯\n"
         h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
@@ -152,6 +172,35 @@ class OpenAskTests(unittest.TestCase):
         store = hb.StateStore(tempfile.mkdtemp()); store.save("cv", launch_flags=cli.build_launch_args(True, None), pane_id="w2:p1")
         rc, _, err, _ = run(["ask", "cv", "hello"], h, store)
         self.assertEqual(rc, 1); self.assertIn("read-only", err); self.assertIn("close", err)
+
+    def test_ask_refuses_on_flag_mismatch_after_restore_non_read_only(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent()])],
+                       "pane process-info": [ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude", "--resume", "C1"]}]})]})
+        store = hb.StateStore(tempfile.mkdtemp()); store.save("cv", launch_flags=cli.build_launch_args(False, None), pane_id="w2:p1")
+        rc, _, err, _ = run(["ask", "cv", "hello"], h, store)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("--read-only", err)
+        self.assertIn("close cv", err); self.assertIn("open cv", err)
+
+    def test_ask_live_session_missing_only_permission_mode_no_traceback(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent()])]})
+        store = hb.StateStore(tempfile.mkdtemp()); store.save("cv", launch_flags=[])
+        rc, _, err, _ = run(["ask", "cv", "hi"], h, store)
+        self.assertEqual(rc, 1)
+        self.assertIn("close cv", err); self.assertIn("open cv", err)
+        self.assertNotIn("--read-only", err); self.assertNotIn("--model", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_ask_live_session_missing_permission_mode_with_stored_model_no_traceback(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent()])]})
+        store = hb.StateStore(tempfile.mkdtemp()); store.save("cv", launch_flags=["--model", "opus"])
+        rc, _, err, _ = run(["ask", "cv", "hi"], h, store)
+        self.assertEqual(rc, 1)
+        self.assertIn("close cv", err); self.assertIn("open cv", err)
+        self.assertNotIn("Traceback", err)
 
     def test_open_read_only_on_live_default_session_refuses(self):
         h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],

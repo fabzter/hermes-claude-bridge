@@ -15,6 +15,8 @@ trap:
 - stops the `claude-bridge` watcher it started (`watch stop`)
 - stops and deletes the throwaway herdr session
 - removes the `claude-bridge-e2e` Hermes webhook route (`hermes webhook remove`)
+- copies `$CLAUDE_BRIDGE_STATE_DIR/watch.log` to `/tmp/claude-e2e-watch.log` (if it exists) so
+  the watcher's log survives for inspection
 - deletes the throwaway `CLAUDE_BRIDGE_STATE_DIR` directory entirely (`rm -rf`)
 
 ## What it does
@@ -27,14 +29,18 @@ trap:
    `README.md` and answer in one sentence — a real turn through real Claude Code.
 4. Prints the Claude session id and captures a transcript (`read e2e -n 120`) to
    `/tmp/claude_live_capture.txt` — this becomes the new `tests/fixtures/claude_reply.txt`.
-5. Asks Claude to run a shell command. Bash is disallowed in read-only mode and
-   `--permission-mode manual` is always pinned, so Claude Code must prompt for it — the
-   script asserts exit code `3` (`approval`) and **fails the run if it is anything else**,
-   then dismisses the prompt with `esc` (never approves it).
-6. Tails the throwaway `$CLAUDE_BRIDGE_STATE_DIR/watch.log` to show the watcher's forwarded
-   event(s).
-7. Opens a second parallel session (`e2e2`) to confirm multiple named sessions coexist,
-   then closes both sessions and runs `gc`.
+5. Asks `e2e` (read-only) to run a shell command. `Bash` is in `--disallowedTools`, so
+   Claude Code must deny it outright without ever prompting — the script asserts exit code
+   `0` and greps the transcript (`read e2e -n 60`, with the prompt-echo line filtered out) to
+   confirm the command's output never actually appears, i.e. it did not run.
+6. Opens a second session (`e2e2`) in **default** mode — no `--read-only` — to confirm the
+   *other* half of the permission story: here `Bash` is not denied, so `--permission-mode
+   manual` must make Claude Code prompt for it. Asks it to run the same shell command; the
+   script asserts exit code `3` (`approval`) and that `state e2e2` reads `approval`, **fails
+   the run if either is anything else**, then dismisses the prompt with `esc` (never
+   approves it) and asserts `state e2e2` has left `approval`.
+7. Tails the throwaway `$CLAUDE_BRIDGE_STATE_DIR/watch.log` to show the watcher's forwarded
+   event(s), lists both sessions to confirm they coexist, then closes both and runs `gc`.
 
 ## Requirements
 

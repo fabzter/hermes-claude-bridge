@@ -90,13 +90,20 @@ def post_webhook(cfg: WebhookConfig, payload: dict, opener=None, now=None, timeo
 
 
 _SECRET_RE = re.compile(r"^\s*Secret:\s*(\S+)\s*$", re.M)
-_ROUTE_URL_RE = re.compile(r"^\s*URL:\s*(\S+)\s*$", re.M)
+_SECRET_LINE_RE = re.compile(r"secret\s*:", re.I)
+_ROUTE_URL_RE = re.compile(r"(?:Webhook\s+)?URL:\s*(\S+)")
 _ROUTE_CONFIRM_RE = re.compile(r"(?:Created|Updated)\s+webhook\s+subscription", re.I)
 
 
 def parse_subscribe_secret(output: str) -> str | None:
     m = _SECRET_RE.search(output or "")
     return m.group(1) if m else None
+
+
+def _redact_secret_lines(text: str) -> str:
+    """Drop any line that looks like it carries a secret — used before interpolating raw
+    subprocess output (stdout/stderr) into an error message that might get logged or relayed."""
+    return "\n".join(ln for ln in (text or "").splitlines() if not _SECRET_LINE_RE.search(ln))
 
 
 def setup_route(state_dir: str, route: str, deliver: str, secret: str | None = None, runner=subprocess.run) -> WebhookConfig:
@@ -108,7 +115,8 @@ def setup_route(state_dir: str, route: str, deliver: str, secret: str | None = N
         argv += ["--secret", secret]
     cp = runner(argv, capture_output=True, text=True)
     if cp.returncode != 0:
-        raise hb.BridgeError("hermes webhook subscribe failed (%d): %s" % (cp.returncode, (cp.stderr or cp.stdout).strip()))
+        detail = _redact_secret_lines((cp.stderr or cp.stdout).strip())
+        raise hb.BridgeError("hermes webhook subscribe failed (%d): %s" % (cp.returncode, detail))
     stdout = cp.stdout or ""
     url_match = _ROUTE_URL_RE.search(stdout)
     # `hermes webhook subscribe` failing silently (wrong subcommand, webhook platform disabled,

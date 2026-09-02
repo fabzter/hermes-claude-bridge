@@ -17,8 +17,8 @@ PERMISSION_MODE_ARGS = ["--permission-mode", "manual"]
 READ_ONLY_ALLOWED = "Read,Grep,Glob,WebSearch,WebFetch"
 # Bash/Edit/Write/NotebookEdit are the obvious file/shell escapes; Agent/Workflow/Skill/Artifact
 # are built-in tools that can themselves invoke further tools (including Bash-equivalents), so
-# read-only must deny them too.
-READ_ONLY_DENIED = "Bash,Edit,Write,NotebookEdit,Agent,Workflow,Skill,Artifact"
+# read-only must deny them too. Task is claude 2.1.236's alias for Agent — deny both names.
+READ_ONLY_DENIED = "Bash,Edit,Write,NotebookEdit,Agent,Workflow,Skill,Artifact,Task"
 # MCP servers configured in the user's Claude settings load regardless of --allowedTools/
 # --disallowedTools (observed live: a read-only session still had a Bash-capable MCP tool).
 # --strict-mcp-config + an empty --mcp-config JSON blob disables all of them for read-only sessions.
@@ -56,13 +56,59 @@ def live_argv(bridge: hb.Bridge, pane_id: str) -> list:
     return argv
 
 
+# Flags build_launch_args can ever emit, in the canonical order it emits them in, and whether
+# each one takes a following value token (False == a bare switch).
+_LAUNCH_FLAG_ORDER = (
+    ("--permission-mode", True), ("--allowedTools", True), ("--disallowedTools", True),
+    ("--strict-mcp-config", False), ("--mcp-config", True), ("--model", True),
+)
+_LAUNCH_FLAG_TAKES_VALUE = dict(_LAUNCH_FLAG_ORDER)
+
+
+def _parse_launch_pairs(tokens: list) -> dict:
+    """Flat launch-arg token list -> {flag: value_or_None}, respecting which flags take a value."""
+    pairs, i = {}, 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if _LAUNCH_FLAG_TAKES_VALUE.get(tok, False):
+            pairs[tok] = tokens[i + 1] if i + 1 < len(tokens) else None
+            i += 2
+        else:
+            pairs[tok] = None
+            i += 1
+    return pairs
+
+
+def merge_launch_args(stored: list, requested: list) -> list:
+    """UNION `requested` onto `stored`, flag/value-aware: a flag already in `stored` has its
+    value REPLACED if `requested` re-specifies it (e.g. --model opus -> --model sonnet) rather
+    than appearing twice; a flag only in `requested` is appended; a flag only in `stored` (e.g.
+    read-only limits the caller didn't ask to change) is kept. Tokens come back in the same
+    canonical order build_launch_args itself uses."""
+    merged = _parse_launch_pairs(stored)
+    merged.update(_parse_launch_pairs(requested))
+    out = []
+    for flag, _ in _LAUNCH_FLAG_ORDER:
+        if flag in merged:
+            out.append(flag)
+            if merged[flag] is not None:
+                out.append(merged[flag])
+    return out
+
+
+def _is_read_only_flags(flags: list) -> bool:
+    return "--allowedTools" in flags
+
+
 def check_flags(bridge: hb.Bridge, name: str, agent: dict) -> None:
     stored = bridge.store.load(name).get("launch_flags") or []
     if stored and not flags_match(stored, live_argv(bridge, agent["pane_id"])):
+        suffix = " --read-only" if _is_read_only_flags(stored) else ""
         raise hb.BridgeError(
-            "session %r is running without its requested flags (%s) — probably relaunched by herdr's "
-            "restore as plain `claude --resume`, so read-only limits are NOT in effect. Run `close %s` "
-            "then `open %s --read-only` to restore them." % (name, " ".join(stored), name, name), hb.EXIT_ERROR)
+            "session %r is running without its requested flags (%s) — herdr's restore likely "
+            "relaunched it as plain `claude --resume`, dropping every flag we set (including the "
+            "pinned permission mode). Run `close %s` then `open %s%s` to restore them."
+            % (name, " ".join(stored), name, name, suffix), hb.EXIT_ERROR)
 
 
 def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, model: str | None, fresh: bool) -> dict:
@@ -70,24 +116,32 @@ def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, 
     if kind == "live":
         requested = build_launch_args(read_only, model)
         stored = bridge.store.load(name).get("launch_flags") or []
-        if any(tok not in stored for tok in requested):
+        missing = [tok for tok in requested if tok not in stored]
+        if missing:
+            if set(missing) <= set(PERMISSION_MODE_ARGS):
+                # Nothing the caller actually asked for is missing — only the always-pinned
+                # permission-mode pair (e.g. a session predating this pin, or one that lost it
+                # to a herdr restore). Don't imply --read-only/--model were requested when
+                # they weren't: that path can't build a remediation flag anyway (`model` may be
+                # None) and it isn't what the caller is missing.
+                suffix = ""
+            elif read_only:
+                suffix = " --read-only"
+            else:
+                suffix = " --model " + model
             raise hb.BridgeError(
                 "session %r is already running without the requested flags (%s); run `close %s` then "
-                "`open %s %s` to apply them"
-                % (name, " ".join(requested), name, name, "--read-only" if read_only else "--model " + model),
-                hb.EXIT_ERROR)
+                "`open %s%s` to apply them" % (name, " ".join(missing), name, name, suffix), hb.EXIT_ERROR)
         agent = bridge.start(name, [], fresh=False, cwd=cwd)
     else:
         # The session isn't live (e.g. the agent process died, or herdr restored it as plain
         # `claude --resume` without our flags). UNION the newly requested tokens with whatever
-        # was stored before, so a caller who only passes --model doesn't silently drop
-        # previously-requested --read-only limits.
+        # was stored before, flag/value-aware, so a caller who only passes --model doesn't
+        # silently drop previously-requested --read-only limits, and re-requesting a flag with a
+        # new value (e.g. a different --model) replaces it instead of appending a duplicate.
         requested = build_launch_args(read_only, model)
         stored = bridge.store.load(name).get("launch_flags") or []
-        flags = list(stored)
-        for tok in requested:
-            if tok not in flags:
-                flags.append(tok)
+        flags = merge_launch_args(stored, requested)
         agent = bridge.start(name, flags, fresh=fresh, cwd=cwd)
         bridge.store.save(name, launch_flags=flags)
     check_flags(bridge, name, agent)

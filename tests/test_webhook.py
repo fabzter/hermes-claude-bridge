@@ -99,6 +99,28 @@ class SetupTests(unittest.TestCase):
         with self.assertRaises(hb.BridgeError):
             wh.setup_route(tempfile.mkdtemp(), "r", "log", None, runner=lambda argv, **kw: CP())
 
+    def test_setup_route_failure_message_redacts_secret_from_stdout(self):
+        class CP:
+            returncode = 1
+            stdout = "Secret: leaked-secret-value\nother output\n"
+            stderr = ""
+        import herdrbridge as hb
+        with self.assertRaises(hb.BridgeError) as ctx:
+            wh.setup_route(tempfile.mkdtemp(), "r", "log", None, runner=lambda argv, **kw: CP())
+        self.assertNotIn("leaked-secret-value", str(ctx.exception))
+
+    def test_setup_route_failure_message_redacts_secret_from_stderr(self):
+        class CP:
+            returncode = 1
+            stdout = ""
+            stderr = "some error\nSecret: leaked-secret-value\nmore context\n"
+        import herdrbridge as hb
+        with self.assertRaises(hb.BridgeError) as ctx:
+            wh.setup_route(tempfile.mkdtemp(), "r", "log", None, runner=lambda argv, **kw: CP())
+        self.assertNotIn("leaked-secret-value", str(ctx.exception))
+        self.assertIn("some error", str(ctx.exception))
+        self.assertIn("more context", str(ctx.exception))
+
     def test_setup_route_secret_parse_failure_does_not_leak_stdout(self):
         d = tempfile.mkdtemp()
         class CP:
@@ -136,6 +158,15 @@ class SetupTests(unittest.TestCase):
             returncode = 0; stdout = "Updated webhook subscription\n  Secret: sekret\n"; stderr = ""
         cfg = wh.setup_route(d, "r", "log", None, runner=lambda argv, **kw: CP())
         self.assertEqual(cfg.url, "http://127.0.0.1:8644/webhooks/r")
+
+    def test_setup_route_uses_webhook_url_line_when_present(self):
+        d = tempfile.mkdtemp()
+        class CP:
+            returncode = 0
+            stdout = "Created webhook subscription\n  Webhook URL: http://127.0.0.1:9999/webhooks/custom\n  Secret: sekret\n"
+            stderr = ""
+        cfg = wh.setup_route(d, "r", "log", None, runner=lambda argv, **kw: CP())
+        self.assertEqual(cfg.url, "http://127.0.0.1:9999/webhooks/custom")
 
 
 class PromptTemplateTests(unittest.TestCase):
