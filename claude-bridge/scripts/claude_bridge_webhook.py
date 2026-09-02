@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.error
 import urllib.request
 
 import herdrbridge as hb
@@ -61,6 +62,7 @@ def save_config(state_dir: str, cfg: WebhookConfig) -> None:
     os.makedirs(state_dir, exist_ok=True)
     p = _cfg_path(state_dir)
     fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.chmod(p, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(dataclasses.asdict(cfg), f, indent=1)
     os.chmod(p, 0o600)
@@ -78,8 +80,11 @@ def post_webhook(cfg: WebhookConfig, payload: dict, opener=None, now=None, timeo
         "X-Webhook-Timestamp": str(ts),
         "X-Webhook-Signature-V2": sign_v2(cfg.secret, ts, body),
     })
-    with (opener or _default_opener)(req, timeout) as resp:
-        return int(getattr(resp, "status", 200))
+    try:
+        with (opener or _default_opener)(req, timeout) as resp:
+            return int(getattr(resp, "status", 200))
+    except urllib.error.HTTPError as e:
+        return int(e.code)
 
 
 _SECRET_RE = re.compile(r"^\s*Secret:\s*(\S+)\s*$", re.M)

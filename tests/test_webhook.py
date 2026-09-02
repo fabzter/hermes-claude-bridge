@@ -1,4 +1,4 @@
-import hashlib, hmac, io, json, os, stat, sys, tempfile, unittest
+import hashlib, hmac, json, os, stat, sys, tempfile, unittest, urllib.error
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "claude-bridge", "scripts"))
 import claude_bridge_webhook as wh
 
@@ -25,8 +25,11 @@ class PayloadTests(unittest.TestCase):
 class ConfigTests(unittest.TestCase):
     def test_save_load_and_mode(self):
         d = tempfile.mkdtemp()
-        wh.save_config(d, wh.WebhookConfig("claude-bridge", "abc", "http://127.0.0.1:8644/webhooks/claude-bridge"))
         p = os.path.join(d, "webhook.json")
+        with open(p, "w") as f:
+            f.write("{}")
+        os.chmod(p, 0o644)
+        wh.save_config(d, wh.WebhookConfig("claude-bridge", "abc", "http://127.0.0.1:8644/webhooks/claude-bridge"))
         self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
         self.assertEqual(wh.load_config(d).secret, "abc")
         self.assertIsNone(wh.load_config(tempfile.mkdtemp()))
@@ -50,6 +53,13 @@ class PostTests(unittest.TestCase):
         self.assertEqual(seen["headers"]["x-webhook-signature-v2"], wh.sign_v2("k", 1700000000, seen["body"]))
         self.assertEqual(seen["headers"]["content-type"], "application/json")
         self.assertEqual(json.loads(seen["body"])["event_type"], "claude_done")
+
+    def test_post_returns_http_error_status(self):
+        def opener(req, timeout):
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+        cfg = wh.WebhookConfig("claude-bridge", "k", "http://127.0.0.1:8644/webhooks/claude-bridge")
+        status = wh.post_webhook(cfg, {"event_type": "claude_done"}, opener=opener, now=lambda: 1700000000)
+        self.assertEqual(status, 401)
 
 
 class SetupTests(unittest.TestCase):
