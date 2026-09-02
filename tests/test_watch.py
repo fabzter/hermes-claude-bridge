@@ -113,6 +113,27 @@ class PidfileTests(unittest.TestCase):
             f.write("not-a-pid")
         self.assertIsNone(w._running_pid(d))
 
+    def test_run_refuses_when_a_daemon_is_already_running(self):
+        # Minor 6: `watch run` (a public --help choice, unlike the internal spawn-only path)
+        # must not clobber the pidfile of an already-running daemon started via `watch start` --
+        # doing so orphans that daemon (unkillable by `watch stop`) and leaves two watchers
+        # posting duplicate webhooks.
+        d = tempfile.mkdtemp()
+        wh.save_config(d, wh.WebhookConfig("claude-bridge", "k", "http://127.0.0.1:8644/webhooks/claude-bridge"))
+        orig = w._running_pid
+        w._running_pid = lambda state_dir: 999999999  # some other, still-alive pid
+        try:
+            out, err = io.StringIO(), io.StringIO()
+
+            def boom():
+                raise AssertionError("bridge_factory must not be called when a watcher is already running")
+
+            rc = w.command("run", d, boom, out, err)
+        finally:
+            w._running_pid = orig
+        self.assertEqual(rc, 1)
+        self.assertIn("already running", err.getvalue())
+
 
 class FakeProc:
     def __init__(self, pid=4242):

@@ -196,6 +196,10 @@ def command(action: str, state_dir: str, bridge_factory, out, err) -> int:
         out.write("watcher started (pid %d), log: %s\n" % (proc.pid, log_path))
         return 0
     if action == "run":
+        if pid and pid != os.getpid():
+            err.write("claude-bridge: watcher already running (pid %d); refusing to start a "
+                      "second `watch run` (use `watch stop` first)\n" % pid)
+            return 1
         cfg = wh.load_config(state_dir)
         if not cfg:
             err.write("claude-bridge: no webhook configured; run `setup-webhook` first\n")

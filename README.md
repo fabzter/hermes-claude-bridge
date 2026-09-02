@@ -35,7 +35,8 @@ python3 ~/.hermes/skills/claude-bridge/scripts/claude-bridge open cv --cwd ~/cv 
 python3 ~/.hermes/skills/claude-bridge/scripts/claude-bridge ask cv "summarize CHANGES.md"
 python3 ~/.hermes/skills/claude-bridge/scripts/claude-bridge ask cv -f /tmp/long-context.md
 python3 ~/.hermes/skills/claude-bridge/scripts/claude-bridge state cv
-python3 ~/.hermes/skills/claude-bridge/scripts/claude-bridge keys cv down enter
+python3 ~/.hermes/skills/claude-bridge/scripts/claude-bridge keys cv down enter --user-decided
+python3 ~/.hermes/skills/claude-bridge/scripts/claude-bridge open cv --reset-flags
 python3 ~/.hermes/skills/claude-bridge/scripts/claude-bridge close cv
 python3 ~/.hermes/skills/claude-bridge/scripts/claude-bridge list
 python3 ~/.hermes/skills/claude-bridge/scripts/claude-bridge setup-webhook --deliver telegram
@@ -74,8 +75,10 @@ terminal pane, driven through herdr's CLI and Unix-socket API:
 run shell commands, but only after the human approves each individual tool prompt inside the pane
 — the bridge surfaces that prompt (`approval` state) rather than ever answering it.
 
-`--read-only` is stricter and requires `manual` (pairing it with any other permission mode is a
-usage error): `--allowedTools Read,Grep,Glob,WebSearch,WebFetch`,
+`--read-only` is stricter and always forces `manual`: pairing it with an explicit non-manual
+`--permission-mode`/`--yolo` is a usage error, and asking for it with no explicit mode on a
+session whose stored mode is non-manual forces `manual` too (with a stderr note) rather than
+silently inheriting the stored one. The bundle: `--allowedTools Read,Grep,Glob,WebSearch,WebFetch`,
 `--disallowedTools Bash,Edit,Write,NotebookEdit,Agent,Workflow,Skill,Artifact,Task`, and
 `--strict-mcp-config` with an empty `--mcp-config` so no MCP server (some of which can act like
 Bash) is available either.
@@ -85,21 +88,34 @@ Bash) is available either.
 Hermes's SKILL.md instructs the agent to pass these only when the user explicitly asked for that
 autonomy for the session, and to say back to the user that it's granting it. The bridge itself
 never passes `--dangerously-skip-permissions` and never widens tools on its own; Claude's replies
-are treated as information, never as instructions to act on unprompted.
+are treated as information, never as instructions to act on unprompted. The very first
+`--yolo`/bypass-permissions `open` of a fresh pane also shows Claude Code's own one-time "Bypass
+Permissions" consent screen; the bridge reports that as `clarify` (exit 5), not `idle` — relay
+the exact screen to the user and, only if they accept, run `keys NAME down enter --user-decided`
+(never `answer`, and never on the agent's own initiative — see SKILL.md §5).
 
-**Flag persistence.** Launch flags are stored per session (in the state file). Asking for a
-different explicit permission mode, `--read-only`, or `--model` on a session that is already
-live is refused (exit 1) — `close NAME` then `open NAME <flags>` applies them. A herdr server
-restart drops every flag (herdr relaunches with plain `claude --resume <id>`); the bridge notices
-the mismatch and `ask` exits 1 with the same `close`/`open` remediation. On restart, an explicit
-ask wins over the previously stored mode, which wins over the `manual` default.
+**Flag persistence.** Launch flags are stored per session (in the state file) and only ever
+accumulate: reopening an already-live session with different flags is refused (exit 1, with the
+exact remediation to run); on `close`/`open` or after a herdr server restart (which drops every
+flag, relaunching as plain `claude --resume <id>`), previously stored flags are unioned with
+whatever's passed this time — a re-specified flag's value is replaced, not duplicated, but a flag
+present only in the stored set is always kept. `--read-only` with no explicit `--permission-mode`
+always forces `manual` (warning on stderr if it drops a stored non-manual mode) rather than
+silently inheriting one. To actually drop a flag (widen past `--read-only`, or downgrade off
+`--yolo`), use `open NAME --reset-flags`: it discards every stored flag and rebuilds the launch
+purely from what's passed on that command line (manual default), while keeping the session's
+resumable conversation. `--reset-flags` and `--fresh` are both refused on an already-live session
+(`close NAME` first). On restart, an explicit ask wins over the previously stored mode, which
+wins over the `manual` default.
 
-**`keys` and confirmation.** `keys NAME K1 K2 ... [--user-decided]` sends raw keys to Claude's
-UI. While a prompt is open (`approval`/`secret`/`clarify`/`blocked`), a key that could
-confirm/dismiss it (enter, return, y, a digit) is refused unless `--user-decided` is passed;
-`esc` and the arrow keys are always allowed. Hermes never answers Claude's prompts on its own —
-it relays them to the user (the watcher delivers them as webhook events) and only sends
-`--user-decided` keys once the user has actually decided in chat.
+**`keys`/`answer` and confirmation.** `keys NAME K1 K2 ... [--user-decided]` sends raw keys to
+Claude's UI; `answer NAME "TEXT" [--user-decided]` answers a free-text `clarify` prompt. While a
+prompt might be open (`approval`/`secret`/`clarify`/`blocked`), both are refused unless
+`--user-decided` is passed — for `keys` specifically when a key that could confirm the prompt is
+among those sent (`enter`, `return`, `y`, a digit `1`-`9`); `esc`, the arrow keys, and `n` are
+never gated. Hermes never answers or confirms Claude's prompts on its own — it relays them to the
+user (the watcher delivers them as webhook events) and only passes `--user-decided` once the user
+has actually decided in chat.
 
 ## Requirements
 

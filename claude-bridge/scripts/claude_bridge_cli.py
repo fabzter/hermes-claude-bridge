@@ -133,14 +133,21 @@ def flags_match(stored_flags: list, argv: list) -> bool:
     return not _missing_pairs(stored_flags, argv)
 
 
-def _remediation_suffix(missing_pairs: dict) -> str:
+def _remediation_suffix(missing_pairs: dict, omit_manual: bool = True) -> str:
     """Map missing/mismatched launch-arg (flag, value) pairs back to the user-facing CLI flags a
     caller would actually type, so the remediation hint lists everything that needs restating: the
     read-only-related flags (--allowedTools/--disallowedTools/--strict-mcp-config/--mcp-config)
     collapse to a single --read-only, --model keeps its value, and --permission-mode maps to
-    --yolo for bypassPermissions or is passed through for any other non-manual value. A missing
-    --permission-mode manual needs no remediation -- it's build_launch_args's own ambient default,
-    not something the caller must ask for again."""
+    --yolo for bypassPermissions or is passed through for any other non-manual value.
+
+    `omit_manual` controls a missing/mismatched `--permission-mode manual` specifically: when
+    True (check_flags's use -- herdr's restore silently dropped every flag, and re-deriving
+    "manual" is just build_launch_args's own ambient default, not something the caller must ask
+    for again) it's left out of the suffix. When False (ensure_open's live-session refusal),
+    "manual" is emitted like any other explicit mode -- there the *stored* mode is the non-manual
+    one, so a caller who explicitly typed `--permission-mode manual` must see it echoed back, or
+    the printed `close NAME` then `open NAME` remediation would silently re-derive the stored
+    non-manual mode instead and re-grant the very autonomy the caller asked to revoke."""
     tokens = []
     if _is_read_only_flags(missing_pairs):
         tokens.append("--read-only")
@@ -150,7 +157,7 @@ def _remediation_suffix(missing_pairs: dict) -> str:
         mode = missing_pairs["--permission-mode"]
         if mode == "bypassPermissions":
             tokens.append("--yolo")
-        elif mode and mode != "manual":
+        elif mode and (mode != "manual" or not omit_manual):
             tokens += ["--permission-mode", mode]
     return (" " + " ".join(tokens)) if tokens else ""
 
@@ -169,9 +176,16 @@ def check_flags(bridge: hb.Bridge, name: str, agent: dict) -> None:
 
 
 def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, model: str | None, fresh: bool,
-                 permission_mode: str | None = None) -> dict:
+                 permission_mode: str | None = None, reset_flags: bool = False, err=None) -> dict:
+    err = err if err is not None else sys.stderr
     kind, _ = bridge.resolve(name)
     if kind == "live":
+        if reset_flags:
+            raise hb.BridgeError(
+                "session %r is live; run `close %s` first to use --reset-flags" % (name, name), hb.EXIT_ERROR)
+        if fresh:
+            raise hb.BridgeError(
+                "session %r is live; run `close %s` first to use --fresh" % (name, name), hb.EXIT_ERROR)
         requested = build_launch_args(read_only, model, permission_mode or "manual")
         stored = bridge.store.load(name).get("launch_flags") or []
         # Compare flag-by-flag (value included), not token-by-token: a stored --model with a
@@ -197,13 +211,17 @@ def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, 
                     missing_tokens.append(flag)
                     if missing_pairs[flag] is not None:
                         missing_tokens.append(missing_pairs[flag])
-            # _remediation_suffix already omits a bare --permission-mode manual (build_launch_args's
-            # own ambient default, not something the caller asked for) and lists every other missing
-            # flag/value pair the caller would actually have to restate.
+            # omit_manual=False: unlike check_flags (where a missing --permission-mode manual is
+            # just build_launch_args's own ambient default being re-derived), here the *stored*
+            # mode is the non-manual one, so an explicitly requested manual must be echoed back in
+            # the remediation itself -- otherwise the printed `close NAME` then `open NAME`
+            # sequence would silently re-derive the stored non-manual mode on restart and re-grant
+            # the very autonomy this refusal was supposed to be blocking (Critical 1).
             raise hb.BridgeError(
                 "session %r is already running without the requested flags (%s); run `close %s` then "
                 "`open %s%s` to apply them" % (name, " ".join(missing_tokens), name, name,
-                                                _remediation_suffix(missing_pairs)), hb.EXIT_ERROR)
+                                                _remediation_suffix(missing_pairs, omit_manual=False)),
+                hb.EXIT_ERROR)
         agent = bridge.start(name, [], fresh=False, cwd=cwd)
     else:
         # The session isn't live (e.g. the agent process died, or herdr restored it as plain
@@ -211,14 +229,25 @@ def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, 
         # was stored before, flag/value-aware, so a caller who only passes --model doesn't
         # silently drop previously-requested --read-only limits, and re-requesting a flag with a
         # new value (e.g. a different --model) replaces it instead of appending a duplicate.
-        stored = bridge.store.load(name).get("launch_flags") or []
-        stored_mode = _parse_launch_pairs(stored).get("--permission-mode")
+        # --reset-flags opts out of that union entirely: ignore whatever was stored (including its
+        # permission mode) and build the launch purely from what was passed on this command line
+        # (the resumable session id, stored separately, is untouched -- only launch_flags reset).
+        stored = [] if reset_flags else (bridge.store.load(name).get("launch_flags") or [])
+        stored_mode = None if reset_flags else _parse_launch_pairs(stored).get("--permission-mode")
         # An explicit ask always wins; absent one, keep whatever mode was already stored (so a
         # bare restart doesn't silently downgrade a previously granted --yolo); absent both,
         # fall back to the pinned "manual" default for a genuinely new session.
         effective_mode = permission_mode or stored_mode or "manual"
+        if read_only and permission_mode is None and effective_mode not in (None, "manual"):
+            # A bare --read-only (no explicit --permission-mode) must never silently inherit a
+            # stored non-manual mode -- that would launch the exact bypassPermissions+read-only
+            # combination the CLI rejects with exit 2 when both flags are typed explicitly
+            # (Critical 2). A read-only ask is an implicit manual ask; force it and say so.
+            err.write("claude-bridge: --read-only forces --permission-mode manual (stored %s dropped)\n"
+                      % effective_mode)
+            effective_mode = "manual"
         requested = build_launch_args(read_only, model, effective_mode)
-        flags = merge_launch_args(stored, requested)
+        flags = requested if reset_flags else merge_launch_args(stored, requested)
         agent = bridge.start(name, flags, fresh=fresh, cwd=cwd)
         bridge.store.save(name, launch_flags=flags)
     check_flags(bridge, name, agent)
@@ -250,6 +279,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--model", help="Claude model name")
     add_permission_args(sp)
     sp.add_argument("--fresh", action="store_true", help="start a new conversation instead of resuming")
+    sp.add_argument("--reset-flags", action="store_true",
+                     help="ignore stored launch flags entirely and relaunch from only the flags "
+                          "passed here (manual default); keeps the resumable session id; refused "
+                          "on a live session (close NAME first). Use this to drop a previously "
+                          "requested --read-only or permission mode -- stored flags otherwise only "
+                          "ever accumulate")
     sp = named("ask", "send a message (auto-opens), wait, print Claude's reply")
     sp.add_argument("text", nargs="?", help="message; '-' reads stdin")
     sp.add_argument("-f", "--file", help="read the message from FILE")
@@ -261,6 +296,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-n", "--lines", type=int, default=120)
     sp = named("answer", "answer a free-text question Claude asked (clarify state)")
     sp.add_argument("text")
+    sp.add_argument("--user-decided", action="store_true",
+                     help="required while a prompt might be open (approval/secret/clarify/"
+                          "blocked) — only pass this when the user has actually decided in chat; "
+                          "not needed on idle/busy")
     sp = named("keys", "send raw keys to Claude's UI (only when the user explicitly decided)")
     sp.add_argument("keys", nargs="+")
     sp.add_argument("--user-decided", action="store_true",
@@ -342,13 +381,14 @@ def main(argv=None, bridge_factory=None, stdout=None, stderr=None) -> int:
             return 0
         name = hb.validate_name(args.name)
         if args.cmd == "open":
-            a = ensure_open(b, name, args.cwd, args.read_only, args.model, args.fresh, permission_mode)
+            a = ensure_open(b, name, args.cwd, args.read_only, args.model, args.fresh, permission_mode,
+                             args.reset_flags, err)
             st = b.state(name)[0]
             out.write("%s %s %s\n" % (name, a.get("pane_id"), st))
             return 0 if st in ("idle", "busy") else hb.state_exit(st)
         if args.cmd == "ask":
             text = _text(args)
-            a = ensure_open(b, name, args.cwd, args.read_only, args.model, False, permission_mode)
+            a = ensure_open(b, name, args.cwd, args.read_only, args.model, False, permission_mode, err=err)
             state, reply, truncated, dialog = b.send(name, text, args.timeout * 1000)
             out.write(reply + ("\n" if reply and not reply.endswith("\n") else ""))
             if truncated:
@@ -362,6 +402,11 @@ def main(argv=None, bridge_factory=None, stdout=None, stderr=None) -> int:
         if args.cmd == "read":
             out.write(b.read(name, args.lines)); return 0
         if args.cmd == "answer":
+            state, _ = b.state(name)
+            if state in _KEYS_GATED_STATES and not args.user_decided:
+                raise hb.BridgeError(
+                    "answering while a prompt might be open requires --user-decided (the user "
+                    "must have decided in chat)", hb.EXIT_ERROR)
             st = b.answer(name, args.text); out.write(st + "\n"); return 0 if st == "busy" else hb.state_exit(st)
         if args.cmd == "keys":
             state, a = b.state(name)

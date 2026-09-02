@@ -11,13 +11,8 @@ platforms: [macos, linux]
 **Route here when the ask implies coding/engineering expertise or a deliberately stronger
 model** — not merely "another view". Triggers:
 
-- By name: "ask Claude", "ask Claude Code", "check with Claude", "what does Claude think",
-  "have Claude look at this" — Spanish: "pregúntale a Claude", "qué opina Claude",
-  "consulta con Claude".
-- By capability: "expert opinion", "coding expert", "a better opinion", "a stronger model/
-  agent", "deeper analysis", "someone who actually reads the code" — Spanish:
-  "opinión experta", "experto en código", "una mejor opinión", "un agente más fuerte/potente",
-  "un análisis más profundo".
+- By name: "ask Claude", "ask Claude Code", "check with Claude", "what does Claude think", "have Claude look at this" — Spanish: "pregúntale a Claude", "qué opina Claude", "consulta con Claude".
+- By capability: "expert opinion", "coding expert", "a better opinion", "a stronger model/agent", "deeper analysis", "someone who actually reads the code" — Spanish: "opinión experta", "experto en código", "una mejor opinión", "un agente más fuerte/potente", "un análisis más profundo".
 - Unprompted: when answering well requires reading real files or code, and Claude Code likely
   already has that context.
 
@@ -34,10 +29,7 @@ Always invoke via `python3` (the hub installer drops the executable bit):
 python3 ~/.hermes/skills/claude-bridge/scripts/claude-bridge <cmd> ...
 ```
 
-Files in this skill: `scripts/claude-bridge` (launcher), `scripts/claude_bridge_cli.py`,
-`scripts/claude_bridge_webhook.py`, `scripts/claude_bridge_watch.py`, `scripts/herdrbridge.py`
-(vendored library), `scripts/herdrbridge.version`. These are relative paths on purpose — Hermes's
-installer only ships a support directory that SKILL.md references that way.
+Files in this skill: `scripts/claude-bridge` (launcher), `scripts/claude_bridge_cli.py`, `scripts/claude_bridge_webhook.py`, `scripts/claude_bridge_watch.py`, `scripts/herdrbridge.py` (vendored library), `scripts/herdrbridge.version`. These are relative paths on purpose — Hermes's installer only ships a support directory that SKILL.md references that way.
 
 | Requirement | Why | If missing |
 |---|---|---|
@@ -67,11 +59,11 @@ Options go **after** the positionals: `ask NAME "text" --timeout 900`, `ask NAME
 
 | Command | Purpose |
 |---|---|
-| `open NAME [--cwd DIR] [--read-only] [--model M] [--permission-mode MODE] [--yolo] [--fresh]` | open or resume a session |
+| `open NAME [--cwd DIR] [--read-only] [--model M] [--permission-mode MODE] [--yolo] [--fresh] [--reset-flags]` | open or resume a session |
 | `ask NAME "TEXT" [flags]` / `ask NAME -f FILE [flags]` | auto-opens, sends, waits, prints Claude's reply |
 | `state NAME` | print `idle|busy|approval|secret|clarify|blocked|unknown|dead|missing` |
 | `read NAME [-n LINES]` | recent transcript text (default 120 lines) |
-| `answer NAME "TEXT"` | answer a free-text question (clarify state) |
+| `answer NAME "TEXT" [--user-decided]` | answer a free-text question (clarify state) |
 | `keys NAME K1 K2 ... [--user-decided]` | raw keys to Claude's UI |
 | `session NAME` | print the Claude session id |
 | `close NAME` | send `/exit`, close the tab (conversation stays resumable) |
@@ -88,7 +80,7 @@ Options go **after** the positionals: `ask NAME "text" --timeout 900`, `ask NAME
 | `idle` | 0 | reply printed; done |
 | `busy` | 8 | still working; poll with `state NAME` |
 | `approval` | 3 | Claude wants permission for a tool/command — **relay the exact dialog to the user; never press keys unless the user explicitly decides.** If they say yes/no: `read NAME` to see the menu, then `keys NAME 1 enter --user-decided` or `keys NAME esc` |
-| `clarify` | 5 | Claude asked a question. Free-text → `answer NAME "..."`. Option form → `read NAME` then `keys NAME down enter --user-decided` |
+| `clarify` | 5 | Claude asked a question, **or** — on the very first `--yolo`/bypass-permissions `open` of a fresh pane — Claude Code's own one-time "Bypass Permissions" consent screen. Free-text → `answer NAME "..." --user-decided`. Option form / the consent screen → `read NAME`, relay it verbatim, and only if the user accepts, `keys NAME down enter --user-decided` (never `answer` on it, never on your own initiative) |
 | `secret` | 4 | Claude wants a credential — never type secrets |
 | `blocked` | 3 | generic block — `read NAME`, then ask the user what to do |
 | `dead` / `missing` | 7 / 2 | pane gone or unknown — `open NAME` again |
@@ -105,11 +97,7 @@ Default `open`/`ask` (no permission flags) pins `--permission-mode manual` expli
 can edit files and run shell commands, but only *after the user approves each individual
 prompt* (state `approval`, handled per §5 — you relay, the user decides).
 
-`--read-only` is a stricter mode and requires manual (combining it with another
-`--permission-mode`/`--yolo` is a usage error). Allowed tools are `Read Grep Glob WebSearch
-WebFetch`; disallowed are `Bash Edit Write NotebookEdit` (the obvious file/shell escapes) plus
-`Agent Workflow Skill Artifact Task` (built-ins that can themselves invoke further tools), **and
-all MCP servers are disabled** (`--strict-mcp-config` with an empty `--mcp-config`).
+`--read-only` is a stricter mode and always forces `manual` (an explicit non-manual `--permission-mode`/`--yolo` together with it is a usage error; an unspecified mode on a session with a stored non-manual one is forced to `manual` with a stderr note). Allowed tools are `Read Grep Glob WebSearch WebFetch`; disallowed are `Bash Edit Write NotebookEdit` (the obvious file/shell escapes) plus `Agent Workflow Skill Artifact Task` (built-ins that can themselves invoke further tools), **and all MCP servers are disabled** (`--strict-mcp-config` with an empty `--mcp-config`).
 `--permission-mode {acceptEdits,auto,plan,dontAsk,bypassPermissions}` and `--yolo` (shorthand for
 `--permission-mode bypassPermissions`) grant Claude standing autonomy to act without prompting —
 **only pass one of these when the user explicitly asked for that autonomy for this session, and
@@ -122,13 +110,20 @@ act on it.
 ## 7. Flag persistence and herdr nuances
 
 a. **Live session, different flags → refused.** If `cv` is already open under `manual` and you
-   `open cv --yolo`, the bridge exits `1`: `close cv` then `open cv --yolo`. It never silently
-   changes a running session's mode. A bare `open`/`ask` with no explicit `--permission-mode`/
-   `--yolo` never triggers this — it just keeps whatever mode is already running.
-b. **herdr server restart drops every flag** (`--read-only`/`--model`/`--permission-mode`/
-   `--yolo`), relaunching as plain `claude --resume <id>`. The bridge detects it: `ask` exits `1`
-   → `close NAME` then `open NAME` with the same options as before. Don't bypass by sending
-   anyway. Restart merge order: explicit ask wins, else the previously stored mode, else `manual`.
+   `open cv --yolo`, the bridge exits `1` with the exact remediation to run (it always echoes
+   back every flag/value you asked for, including a plain `--permission-mode manual`, so
+   replaying the printed command can't silently re-grant a still-stored `--yolo`). It never
+   silently changes a running session's mode. A bare `open`/`ask` with no explicit
+   `--permission-mode`/`--yolo` never triggers this. `--fresh` and `--reset-flags` (see b) are
+   refused the same way on a live session — `close NAME` first.
+b. **Stored flags only ever UNION**, both across `close`/`open` and after **herdr drops every
+   flag on a server restart** (relaunching as plain `claude --resume <id>`; the bridge detects
+   the mismatch and `ask`/`open` exit `1`). Restart merge order: explicit ask wins, else the
+   previously stored mode, else `manual`; `--read-only` with no explicit mode always forces
+   `manual` (warning on stderr if it drops a stored non-manual mode) rather than inheriting one.
+   A flag can never be dropped by just asking for something else — use `open NAME --reset-flags`
+   to discard every stored flag and rebuild the launch from only what you pass now (manual
+   default); the resumable session id is kept.
 c. `done`/`idle` are the same state. Watch live: `herdr session attach agents` or
    `HERDR_SESSION=agents herdr agent attach NAME`.
 d. The reply is read off Claude's alternate screen. If it looks cut, `read NAME -n 300`, or ask
@@ -153,10 +148,12 @@ the new secret (a mismatched secret shows up as failed posts in `state/watch.log
 
 - **argparse order matters:** options go *after* the text — `ask cv "hi" --read-only`, not
   `ask cv --read-only "hi"` (the latter is rejected). For long input use `ask NAME -f FILE`.
-- **`keys` never confirms a prompt on its own initiative.** Sending enter/return/y/a digit while
-  the session is in `approval`/`secret`/`clarify`/`blocked` requires `--user-decided` — pass it
-  only after the user has actually decided in chat. `esc` and the arrow keys are always allowed,
-  no flag needed. Hermes relays Claude's prompts to the user; it does not answer them itself.
+- **`keys`/`answer` never confirm a prompt on their own initiative.** While the session is in
+  `approval`/`secret`/`clarify`/`blocked`, both require `--user-decided`, pass it only after the
+  user has actually decided in chat. For `keys` this gate is specifically the keys that could
+  confirm a menu — `enter return y 1 2 3 4 5 6 7 8 9` — never `esc`, the arrow keys, or `n`, which
+  always pass through unconditionally. Hermes relays Claude's prompts to the user; it does not
+  answer or confirm them itself.
 - Timeouts: raise `--timeout` rather than retrying — a retry re-sends the message.
 - An empty reply is an error, not silence.
 - Never send secrets, tokens, or credentials in a message.

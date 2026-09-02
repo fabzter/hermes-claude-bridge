@@ -271,6 +271,121 @@ class OpenAskTests(unittest.TestCase):
         self.assertIn("close cv", err); self.assertIn("open cv", err)
         self.assertFalse([c for c in h.calls if c[:3] == ("cli", "agent", "prompt")])
 
+    def test_live_yolo_open_manual_remediation_includes_permission_mode_and_round_trips(self):
+        # Critical 1 fix: the live-session refusal for an explicit `open cv --permission-mode
+        # manual` must include `--permission-mode manual` in the printed remediation itself (not
+        # just the "missing flags" token list) -- omitting it (as build_launch_args's ambient
+        # default, correct only for check_flags) would have the printed `close cv` then `open cv`
+        # remediation silently re-launch under the still-stored bypassPermissions mode, undoing
+        # the very ask that was refused.
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent(name="cv")])]})
+        store = hb.StateStore(tempfile.mkdtemp())
+        store.save("cv", launch_flags=cli.build_launch_args(False, None, "bypassPermissions"))
+        rc, _, err, _ = run(["open", "cv", "--permission-mode", "manual"], h, store)
+        self.assertEqual(rc, 1)
+        self.assertIn("open cv --permission-mode manual", err)
+
+        # Round-trip: running exactly that remediation ("close cv" then "open cv
+        # --permission-mode manual") through the restart merge must actually land the session in
+        # manual mode, not re-grant the stored bypassPermissions.
+        h2 = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                        "agent list": [ok("agent_list", agents=[]), ok("agent_list", agents=[]),
+                                       ok("agent_list", agents=[cagent(name="cv", session="C9")])],
+                        "tab create": [ok("tab_created", tab={"tab_id": "w2:t1"}, root_pane={"pane_id": "w2:p1"})],
+                        "agent start": [ok("agent_started", agent=cagent(name="cv", session="C9"))],
+                        "pane get": [ok("pane_info", pane={"pane_id": "w2:p1"})],
+                        "pane process-info": [READY_SHELL,
+                            ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude"] + cli.build_launch_args(False, None, "manual")}]})]})
+        rc2, _, _, store2 = run(["open", "cv", "--permission-mode", "manual"], h2, store)
+        self.assertEqual(rc2, 0)
+        start = [c for c in h2.calls if c[:3] == ("cli", "agent", "start")][0]
+        argv_sent = start[start.index("--") + 1:]
+        self.assertIn("manual", argv_sent)
+        self.assertNotIn("bypassPermissions", argv_sent)
+        self.assertEqual(store2.load("cv")["launch_flags"], cli.build_launch_args(False, None, "manual"))
+
+    def test_open_read_only_on_restart_with_stored_yolo_forces_manual_and_warns(self):
+        # Critical 2 fix: on the restart/missing branch, --read-only with an unspecified
+        # --permission-mode must not silently inherit a stored non-manual mode (which would
+        # launch the exact bypassPermissions+read-only combination the CLI rejects with exit 2
+        # when both flags are typed explicitly). It must force manual and warn on stderr.
+        stored_flags = cli.build_launch_args(False, None, "bypassPermissions")
+        flags_final = cli.build_launch_args(True, None, "manual")
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[]), ok("agent_list", agents=[]),
+                                      ok("agent_list", agents=[cagent(name="y", session="C10")])],
+                       "tab create": [ok("tab_created", tab={"tab_id": "w2:t1"}, root_pane={"pane_id": "w2:p1"})],
+                       "agent start": [ok("agent_started", agent=cagent(name="y", session="C10"))],
+                       "pane get": [ok("pane_info", pane={"pane_id": "w2:p1"})],
+                       "pane process-info": [READY_SHELL,
+                           ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude"] + flags_final}]})]})
+        store = hb.StateStore(tempfile.mkdtemp())
+        store.save("y", launch_flags=stored_flags)
+        rc, out, err, store = run(["open", "y", "--read-only"], h, store)
+        self.assertEqual(rc, 0)
+        start = [c for c in h.calls if c[:3] == ("cli", "agent", "start")][0]
+        argv_sent = start[start.index("--") + 1:]
+        self.assertIn("manual", argv_sent)
+        self.assertNotIn("bypassPermissions", argv_sent)
+        self.assertIn("--allowedTools", argv_sent)
+        self.assertIn(
+            "claude-bridge: --read-only forces --permission-mode manual (stored bypassPermissions dropped)",
+            err)
+        self.assertEqual(store.load("y")["launch_flags"], flags_final)
+
+    def test_open_read_only_with_explicit_non_manual_mode_stays_usage_error(self):
+        # The other half of Critical 2: an explicit non-manual --permission-mode combined with
+        # --read-only remains a usage error (exit 2), unchanged.
+        h = FakeHerdr({})
+        rc, _, err, _ = run(["open", "y", "--read-only", "--permission-mode", "plan"], h)
+        self.assertEqual(rc, 2)
+        self.assertIn("--read-only requires --permission-mode manual", err)
+
+    def test_open_reset_flags_builds_from_cli_only_and_replaces_stored(self):
+        stored_flags = cli.build_launch_args(True, None)  # stored read-only, manual
+        flags_final = cli.build_launch_args(False, None, "manual")
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[]), ok("agent_list", agents=[]),
+                                      ok("agent_list", agents=[cagent(name="y", session="C11")])],
+                       "tab create": [ok("tab_created", tab={"tab_id": "w2:t1"}, root_pane={"pane_id": "w2:p1"})],
+                       "agent start": [ok("agent_started", agent=cagent(name="y", session="C11"))],
+                       "pane get": [ok("pane_info", pane={"pane_id": "w2:p1"})],
+                       "pane process-info": [READY_SHELL,
+                           ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude"] + flags_final}]})]})
+        store = hb.StateStore(tempfile.mkdtemp())
+        store.save("y", launch_flags=stored_flags, agent_session_id="OLDSESS")
+        rc, out, _, store = run(["open", "y", "--reset-flags"], h, store)
+        self.assertEqual(rc, 0)
+        start = [c for c in h.calls if c[:3] == ("cli", "agent", "start")][0]
+        argv_sent = start[start.index("--") + 1:]
+        self.assertNotIn("--allowedTools", argv_sent)
+        self.assertIn("--resume", argv_sent)
+        self.assertIn("OLDSESS", argv_sent)
+        self.assertEqual(store.load("y")["launch_flags"], flags_final)
+
+    def test_open_reset_flags_refused_on_live_session(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent(name="cv")])]})
+        store = hb.StateStore(tempfile.mkdtemp())
+        store.save("cv", launch_flags=cli.build_launch_args(True, None))
+        rc, _, err, _ = run(["open", "cv", "--reset-flags"], h, store)
+        self.assertEqual(rc, 1)
+        self.assertIn("close cv", err)
+        self.assertIn("--reset-flags", err)
+        self.assertFalse([c for c in h.calls if c[:3] == ("cli", "agent", "start")])
+
+    def test_open_fresh_on_live_session_refused(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent(name="cv")])]})
+        store = hb.StateStore(tempfile.mkdtemp())
+        store.save("cv", launch_flags=cli.build_launch_args(False, None))
+        rc, _, err, _ = run(["open", "cv", "--fresh"], h, store)
+        self.assertEqual(rc, 1)
+        self.assertIn("close cv", err)
+        self.assertIn("--fresh", err)
+        self.assertFalse([c for c in h.calls if c[:3] == ("cli", "agent", "start")])
+
     def test_open_after_restart_bare_open_keeps_stored_yolo(self):
         flags = cli.build_launch_args(False, None, "bypassPermissions")
         h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
@@ -515,6 +630,48 @@ class OpenAskTests(unittest.TestCase):
         rc, _, _, _ = run(["keys", "cv", "enter"], h)
         self.assertEqual(rc, 0)
         self.assertEqual([c for c in h.calls if c[:3] == ("cli", "agent", "send-keys")][0][3:], ("cv", "enter"))
+
+    def test_answer_on_clarify_refused_without_user_decided(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent(status="blocked")])],
+                       "agent explain": [{"matched_rule": {"id": "live_blocked_form"}}]})
+        rc, _, err, _ = run(["answer", "cv", "42"], h)
+        self.assertEqual(rc, 1)
+        self.assertIn("--user-decided", err)
+        self.assertFalse([c for c in h.calls if c[:3] == ("cli", "pane", "send-text")])
+
+    def test_answer_on_clarify_allowed_with_user_decided(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent(status="blocked")]),
+                                      ok("agent_list", agents=[cagent(status="blocked")]),
+                                      ok("agent_list", agents=[cagent(status="idle")])],
+                       "agent explain": [{"matched_rule": {"id": "live_blocked_form"}}],
+                       "pane send-text": [ok("pane_send_text")],
+                       "pane send-keys": [ok("pane_send_keys")]})
+        rc, out, _, _ = run(["answer", "cv", "42", "--user-decided"], h)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "idle")
+
+    def test_answer_on_approval_refused_without_user_decided(self):
+        # Important 5: `answer` must be gated the same way `keys` already is in every state where
+        # a prompt might be open, not just `clarify` -- approval/secret/blocked too.
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent(status="blocked")])],
+                       "agent explain": [{"matched_rule": {"id": "bash_permission_prompt"}}]})
+        rc, _, err, _ = run(["answer", "cv", "yes"], h)
+        self.assertEqual(rc, 1)
+        self.assertIn("--user-decided", err)
+        self.assertFalse([c for c in h.calls if c[:3] == ("cli", "pane", "send-text")])
+
+    def test_answer_on_idle_keeps_current_behavior_without_user_decided(self):
+        # idle/busy are unaffected by the new gate: Bridge.answer's own "not clarify" refusal
+        # still fires (unchanged), with no --user-decided needed to reach it.
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent(status="idle")])]})
+        rc, _, err, _ = run(["answer", "cv", "hi"], h)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("--user-decided", err)
+        self.assertIn("not clarify", err)
 
     def test_open_live_session_missing_read_only_and_model_lists_both(self):
         h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
