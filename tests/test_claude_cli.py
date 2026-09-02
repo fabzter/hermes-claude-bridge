@@ -214,6 +214,38 @@ class OpenAskTests(unittest.TestCase):
         self.assertIn("--permission-mode bypassPermissions", err)
         self.assertFalse([c for c in h.calls if c[:3] == ("cli", "agent", "prompt")])
 
+    def test_ask_bare_on_live_yolo_session_is_allowed(self):
+        # The other half of the (a) fix: a bare ask/open on an already-live --yolo session must
+        # NOT be refused just because it didn't repeat --yolo -- only an explicit, different mode
+        # should trigger the close/open remediation (covered by the two tests above/below).
+        after = "> hi\n\n⏺ hi there\n\n╭──╮\n│ ❯ │\n╰──╯\n"
+        flags = cli.build_launch_args(False, None, "bypassPermissions")
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent()])],
+                       "agent prompt": [ok("agent_prompt", agent=cagent())],
+                       "pane process-info": [ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude", "--resume", "C1"] + flags}]})]},
+                      {"agent read": ["", after]})
+        store = hb.StateStore(tempfile.mkdtemp())
+        store.save("cv", launch_flags=flags)
+        rc, out, _, _ = run(["ask", "cv", "hi"], h, store)
+        self.assertEqual((rc, out.strip()), (0, "hi there"))
+        self.assertTrue([c for c in h.calls if c[:3] == ("cli", "agent", "prompt")])
+
+    def test_ask_explicit_manual_on_live_yolo_session_refuses(self):
+        # An explicit ask always wins over "session is already live under something else" --
+        # asking for manual on a live --yolo session must still be refused with the close/open
+        # remediation, exactly like asking for --yolo on a live manual session already is above.
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent()])]})
+        store = hb.StateStore(tempfile.mkdtemp())
+        store.save("cv", launch_flags=cli.build_launch_args(False, None, "bypassPermissions"))
+        rc, _, err, _ = run(["ask", "cv", "hi", "--permission-mode", "manual"], h, store)
+        self.assertEqual(rc, 1)
+        self.assertIn("already running", err)
+        self.assertIn("--permission-mode manual", err)
+        self.assertIn("close cv", err); self.assertIn("open cv", err)
+        self.assertFalse([c for c in h.calls if c[:3] == ("cli", "agent", "prompt")])
+
     def test_open_after_restart_bare_open_keeps_stored_yolo(self):
         flags = cli.build_launch_args(False, None, "bypassPermissions")
         h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
@@ -231,6 +263,47 @@ class OpenAskTests(unittest.TestCase):
         argv_sent = start[start.index("--") + 1:]
         self.assertIn("bypassPermissions", argv_sent)
         self.assertEqual(store.load("y")["launch_flags"], flags)
+
+    def test_open_after_restart_explicit_manual_overrides_stored_yolo(self):
+        # The (b) fix: on a restart, an explicit ask always wins over whatever was stored, even
+        # when the explicit ask is "manual" downgrading a previously granted --yolo.
+        stored_flags = cli.build_launch_args(False, None, "bypassPermissions")
+        flags_final = cli.build_launch_args(False, None, "manual")
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[]), ok("agent_list", agents=[]), ok("agent_list", agents=[cagent(name="y", session="C7")])],
+                       "tab create": [ok("tab_created", tab={"tab_id": "w2:t1"}, root_pane={"pane_id": "w2:p1"})],
+                       "agent start": [ok("agent_started", agent=cagent(name="y", session="C7"))],
+                       "pane get": [ok("pane_info", pane={"pane_id": "w2:p1"})],
+                       "pane process-info": [READY_SHELL,
+                           ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude"] + flags_final}]})]})
+        store = hb.StateStore(tempfile.mkdtemp())
+        store.save("y", launch_flags=stored_flags)
+        rc, out, _, store = run(["open", "y", "--permission-mode", "manual"], h, store)
+        self.assertEqual(rc, 0)
+        start = [c for c in h.calls if c[:3] == ("cli", "agent", "start")][0]
+        argv_sent = start[start.index("--") + 1:]
+        self.assertIn("manual", argv_sent)
+        self.assertNotIn("bypassPermissions", argv_sent)
+        self.assertEqual(store.load("y")["launch_flags"], flags_final)
+
+    def test_open_after_restart_yolo_overrides_stored_manual(self):
+        stored_flags = cli.build_launch_args(False, None, "manual")
+        flags_final = cli.build_launch_args(False, None, "bypassPermissions")
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[]), ok("agent_list", agents=[]), ok("agent_list", agents=[cagent(name="y", session="C8")])],
+                       "tab create": [ok("tab_created", tab={"tab_id": "w2:t1"}, root_pane={"pane_id": "w2:p1"})],
+                       "agent start": [ok("agent_started", agent=cagent(name="y", session="C8"))],
+                       "pane get": [ok("pane_info", pane={"pane_id": "w2:p1"})],
+                       "pane process-info": [READY_SHELL,
+                           ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude"] + flags_final}]})]})
+        store = hb.StateStore(tempfile.mkdtemp())
+        store.save("y", launch_flags=stored_flags)
+        rc, out, _, store = run(["open", "y", "--yolo"], h, store)
+        self.assertEqual(rc, 0)
+        start = [c for c in h.calls if c[:3] == ("cli", "agent", "start")][0]
+        argv_sent = start[start.index("--") + 1:]
+        self.assertIn("bypassPermissions", argv_sent)
+        self.assertEqual(store.load("y")["launch_flags"], flags_final)
 
     def test_ask_auto_opens_then_prompts(self):
         after = "> hello\n\n⏺ hi there\n\n╭──╮\n│ ❯ │\n╰──╯\n"
@@ -289,24 +362,33 @@ class OpenAskTests(unittest.TestCase):
         self.assertIn("close cv", err)
         self.assertNotIn("Traceback", err)
 
-    def test_ask_live_session_missing_only_permission_mode_no_traceback(self):
+    def test_ask_missing_permission_mode_in_stored_flags_no_longer_refuses(self):
+        # Before the fix, a live session whose stored flags predate the --permission-mode pin (or
+        # never recorded any launch flags at all) was refused on every bare `ask`/`open` until the
+        # user closed/reopened it, because build_launch_args always emitted a "manual" pin that got
+        # compared against whatever (or nothing) was stored -- the same root cause as a granted
+        # --yolo needing to be repeated on every call. Now permission_mode can be None (unspecified)
+        # and an unspecified ask is dropped from that comparison entirely, so this must succeed.
+        after = "> hi\n\n⏺ hi there\n\n╭──╮\n│ ❯ │\n╰──╯\n"
         h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
-                       "agent list": [ok("agent_list", agents=[cagent()])]})
+                       "agent list": [ok("agent_list", agents=[cagent()])],
+                       "agent prompt": [ok("agent_prompt", agent=cagent())]},
+                      {"agent read": ["", after]})
         store = hb.StateStore(tempfile.mkdtemp()); store.save("cv", launch_flags=[])
-        rc, _, err, _ = run(["ask", "cv", "hi"], h, store)
-        self.assertEqual(rc, 1)
-        self.assertIn("close cv", err); self.assertIn("open cv", err)
-        self.assertNotIn("--read-only", err); self.assertNotIn("--model", err)
-        self.assertNotIn("Traceback", err)
+        rc, out, _, _ = run(["ask", "cv", "hi"], h, store)
+        self.assertEqual((rc, out.strip()), (0, "hi there"))
 
-    def test_ask_live_session_missing_permission_mode_with_stored_model_no_traceback(self):
+    def test_ask_missing_permission_mode_with_stored_model_no_longer_refuses(self):
+        after = "> hi\n\n⏺ hi there\n\n╭──╮\n│ ❯ │\n╰──╯\n"
+        argv = ["node", "/x/claude", "--resume", "C1", "--model", "opus"]
         h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
-                       "agent list": [ok("agent_list", agents=[cagent()])]})
+                       "agent list": [ok("agent_list", agents=[cagent()])],
+                       "agent prompt": [ok("agent_prompt", agent=cagent())],
+                       "pane process-info": [ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": argv}]})]},
+                      {"agent read": ["", after]})
         store = hb.StateStore(tempfile.mkdtemp()); store.save("cv", launch_flags=["--model", "opus"])
-        rc, _, err, _ = run(["ask", "cv", "hi"], h, store)
-        self.assertEqual(rc, 1)
-        self.assertIn("close cv", err); self.assertIn("open cv", err)
-        self.assertNotIn("Traceback", err)
+        rc, out, _, _ = run(["ask", "cv", "hi"], h, store)
+        self.assertEqual((rc, out.strip()), (0, "hi there"))
 
     def test_open_read_only_on_live_default_session_refuses(self):
         h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],

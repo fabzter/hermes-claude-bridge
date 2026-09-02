@@ -114,15 +114,23 @@ def check_flags(bridge: hb.Bridge, name: str, agent: dict) -> None:
 
 
 def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, model: str | None, fresh: bool,
-                 permission_mode: str = "manual") -> dict:
+                 permission_mode: str | None = None) -> dict:
     kind, _ = bridge.resolve(name)
     if kind == "live":
-        requested = build_launch_args(read_only, model, permission_mode)
+        requested = build_launch_args(read_only, model, permission_mode or "manual")
         stored = bridge.store.load(name).get("launch_flags") or []
         # Compare flag-by-flag (value included), not token-by-token: a stored --model with a
         # different value must count as a mismatch even though the bare token "--model" is
         # present in both lists.
         requested_pairs = _parse_launch_pairs(requested)
+        if permission_mode is None:
+            # The caller didn't type --yolo/--permission-mode at all, so "manual" above is just
+            # ensure_open's ambient filler for build_launch_args (which always needs *some* mode
+            # to emit the pinned pair) -- not a real ask. Drop it from the comparison so a bare
+            # `open`/`ask` on an already-live session never gets refused just because that session
+            # happens to be running under some other mode (e.g. a previously granted --yolo);
+            # only an explicit, different mode should trigger the close/open remediation below.
+            del requested_pairs["--permission-mode"]
         stored_pairs = _parse_launch_pairs(stored)
         missing_flags = [flag for flag, _ in _LAUNCH_FLAG_ORDER
                           if flag in requested_pairs
@@ -154,17 +162,13 @@ def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, 
         # was stored before, flag/value-aware, so a caller who only passes --model doesn't
         # silently drop previously-requested --read-only limits, and re-requesting a flag with a
         # new value (e.g. a different --model) replaces it instead of appending a duplicate.
-        requested = build_launch_args(read_only, model, permission_mode)
         stored = bridge.store.load(name).get("launch_flags") or []
-        if permission_mode == "manual" and "--permission-mode" in _parse_launch_pairs(stored):
-            # `permission_mode` here is ensure_open's own ambient default, not a real ask — main()
-            # only passes a non-"manual" value when the caller actually typed --yolo/
-            # --permission-mode. Don't let that ambient default silently downgrade a mode already
-            # granted and stored on a previous `open`/`ask --yolo`; strip the pinned pair from
-            # `requested` so merge_launch_args falls through to the stored value below, exactly
-            # like an unspecified --model or --read-only already does. An explicit non-manual ask
-            # (a different value) is left in place and overrides stored, same as --model.
-            requested = requested[2:]  # build_launch_args always emits the pair first
+        stored_mode = _parse_launch_pairs(stored).get("--permission-mode")
+        # An explicit ask always wins; absent one, keep whatever mode was already stored (so a
+        # bare restart doesn't silently downgrade a previously granted --yolo); absent both,
+        # fall back to the pinned "manual" default for a genuinely new session.
+        effective_mode = permission_mode or stored_mode or "manual"
+        requested = build_launch_args(read_only, model, effective_mode)
         flags = merge_launch_args(stored, requested)
         agent = bridge.start(name, flags, fresh=fresh, cwd=cwd)
         bridge.store.save(name, launch_flags=flags)
@@ -182,9 +186,11 @@ def build_parser() -> argparse.ArgumentParser:
         return sp
 
     def add_permission_args(sp):
-        sp.add_argument("--permission-mode", choices=PERMISSION_MODES, default="manual",
-                         help="Claude's --permission-mode; only change this when the user "
-                              "explicitly asked for that autonomy for this session")
+        sp.add_argument("--permission-mode", choices=PERMISSION_MODES, default=None,
+                         help="Claude's --permission-mode (manual for a new session; otherwise "
+                              "keeps whatever mode is already running/stored unless overridden); "
+                              "only change this when the user explicitly asked for that autonomy "
+                              "for this session")
         sp.add_argument("--yolo", action="store_true",
                          help="alias for --permission-mode bypassPermissions; only when the user "
                               "explicitly asked for that autonomy for this session")
@@ -237,17 +243,18 @@ def _text(args) -> str:
     return text
 
 
-def _resolve_permission_mode(args) -> str:
+def _resolve_permission_mode(args) -> str | None:
     """Combine open/ask's --permission-mode and --yolo into the single mode ensure_open needs,
-    enforcing the documented conflicts up front (before any herdr call is made)."""
+    enforcing the documented conflicts up front (before any herdr call is made). Returns None when
+    neither flag was given, so ensure_open can tell "no ask" apart from an explicit "manual" (which
+    must still win over a stored --yolo on a restart, where a bare, unspecified request must not)."""
     mode = args.permission_mode
     if args.yolo:
         if mode not in (None, "manual"):
             raise hb.UsageError(
                 "--yolo conflicts with --permission-mode %s (use one or the other)" % mode)
         mode = "bypassPermissions"
-    mode = mode or "manual"
-    if args.read_only and mode != "manual":
+    if args.read_only and mode not in (None, "manual"):
         raise hb.UsageError("--read-only requires --permission-mode manual")
     return mode
 
