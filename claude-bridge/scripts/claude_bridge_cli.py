@@ -57,6 +57,14 @@ def check_flags(bridge: hb.Bridge, name: str, agent: dict) -> None:
 def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, model: str | None, fresh: bool) -> dict:
     kind, _ = bridge.resolve(name)
     if kind == "live":
+        requested = build_launch_args(read_only, model)
+        stored = bridge.store.load(name).get("launch_flags") or []
+        if any(tok not in stored for tok in requested):
+            raise hb.BridgeError(
+                "session %r is already running without the requested flags (%s); run `close %s` then "
+                "`open %s %s` to apply them"
+                % (name, " ".join(requested), name, name, "--read-only" if read_only else "--model " + model),
+                hb.EXIT_ERROR)
         agent = bridge.start(name, [], fresh=False, cwd=cwd)
     else:
         flags = build_launch_args(read_only, model)
@@ -111,8 +119,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _text(args) -> str:
     if args.file:
-        with open(args.file, "r", encoding="utf-8") as f:
-            text = f.read()
+        try:
+            with open(args.file, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            raise hb.UsageError("cannot read %s: %s" % (args.file, e))
     elif args.text in (None, "-"):
         text = sys.stdin.read()
     else:
@@ -180,7 +191,7 @@ def main(argv=None, bridge_factory=None, stdout=None, stderr=None) -> int:
             a = b.find_agent(name)
             sid = ((a or {}).get("agent_session") or {}).get("value") or b.store.load(name).get("agent_session_id")
             if not sid:
-                err.write("claude-bridge: no session id known for %r\n" % name); return 1
+                err.write("claude-bridge: no session id known for %r\n" % name); return hb.EXIT_ERROR
             out.write(sid + "\n"); return 0
         if args.cmd == "close":
             out.write("closed\n" if b.stop(name) else "nothing to close\n"); return 0

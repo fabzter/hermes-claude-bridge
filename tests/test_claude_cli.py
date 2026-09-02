@@ -79,6 +79,36 @@ class OpenAskTests(unittest.TestCase):
         rc, _, err, _ = run(["ask", "cv", "hello"], h, store)
         self.assertEqual(rc, 1); self.assertIn("read-only", err); self.assertIn("close", err)
 
+    def test_open_read_only_on_live_default_session_refuses(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent()])]})
+        store = hb.StateStore(tempfile.mkdtemp()); store.save("cv", launch_flags=[])
+        rc, _, err, _ = run(["open", "cv", "--read-only"], h, store)
+        self.assertEqual(rc, 1); self.assertIn("already running", err); self.assertIn("close", err)
+        self.assertFalse([c for c in h.calls if c[:3] == ("cli", "agent", "prompt")])
+
+    def test_ask_read_only_on_live_default_session_refuses_before_prompt(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent()])]})
+        store = hb.StateStore(tempfile.mkdtemp()); store.save("cv", launch_flags=[])
+        rc, _, err, _ = run(["ask", "cv", "hi", "--read-only"], h, store)
+        self.assertEqual(rc, 1); self.assertIn("already running", err); self.assertIn("close", err)
+        self.assertFalse([c for c in h.calls if c[:3] == ("cli", "agent", "prompt")])
+
+    def test_open_read_only_on_live_read_only_session_is_ok(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent()])],
+                       "pane process-info": [ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude", "--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED]}]})]})
+        store = hb.StateStore(tempfile.mkdtemp()); store.save("cv", launch_flags=cli.build_launch_args(True, None), pane_id="w2:p1")
+        rc, out, _, _ = run(["open", "cv", "--read-only"], h, store)
+        self.assertEqual(rc, 0)
+
+    def test_ask_missing_file_is_usage_error(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[])]})
+        rc, _, err, _ = run(["ask", "cv", "-f", "/nonexistent/file-that-does-not-exist"], h)
+        self.assertEqual(rc, 2); self.assertIn("cannot read", err)
+
     def test_keys_sends_each_key(self):
         h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
                        "agent list": [ok("agent_list", agents=[cagent(status="blocked")])],
