@@ -6,6 +6,7 @@ import claude_bridge_cli as cli
 from fakes import FakeHerdr, agent, ok
 
 WS = {"workspace_id": "w2", "label": "claude-bridge", "active_tab_id": "w2:t1"}
+READY_SHELL = ok("pane_process_info", process_info={"foreground_processes": [{"name": "zsh", "argv": ["-zsh"]}]})
 def cagent(name="cv", pane="w2:p1", tab="w2:t1", status="idle", session=None):
     return agent(name, pane=pane, tab=tab, ws="w2", status=status, session=session, kind="claude")
 
@@ -38,7 +39,8 @@ class OpenAskTests(unittest.TestCase):
                        "agent list": [ok("agent_list", agents=[]), ok("agent_list", agents=[]), ok("agent_list", agents=[cagent(session="C1")])],
                        "tab create": [ok("tab_created", tab={"tab_id": "w2:t1"}, root_pane={"pane_id": "w2:p1"})],
                        "agent start": [ok("agent_started", agent=cagent(session="C1"))],
-                       "pane process-info": [ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude", "--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED]}]})]})
+                       "pane process-info": [READY_SHELL,
+                           ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude", "--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED]}]})]})
         rc, out, _, store = run(["open", "cv", "--cwd", "/tmp", "--read-only"], h)
         self.assertEqual(rc, 0)
         start = [c for c in h.calls if c[:3] == ("cli", "agent", "start")][0]
@@ -55,7 +57,8 @@ class OpenAskTests(unittest.TestCase):
                        "agent list": [ok("agent_list", agents=[]), ok("agent_list", agents=[]), ok("agent_list", agents=[cagent()])],
                        "tab create": [ok("tab_created", tab={"tab_id": "w2:t1"}, root_pane={"pane_id": "w2:p1"})],
                        "agent start": [ok("agent_started", agent=cagent())],
-                       "agent prompt": [ok("agent_prompt", agent=cagent())]},
+                       "agent prompt": [ok("agent_prompt", agent=cagent())],
+                       "pane process-info": [READY_SHELL]},
                       {"agent read": ["", after]})
         rc, out, _, _ = run(["ask", "cv", "hello"], h)
         self.assertEqual((rc, out.strip()), (0, "hi there"))

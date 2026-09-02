@@ -333,8 +333,10 @@ _HERMES_ECHO = re.compile(r"^\s*●\s*(.*)$")
 _HERMES_BOX_OPEN = re.compile(r"^\s*╭─.*Hermes")
 _HERMES_BOX_CLOSE = re.compile(r"^\s*╰")
 _PROMPT_LINE = re.compile(r"^\s*(│\s*)?❯\s*(│\s*)?$")
-_CLAUDE_ECHO = re.compile(r"^\s*>\s*(.*)$")
-_CLAUDE_CHROME = re.compile(r"(\? for shortcuts|esc to interrupt|bypass permissions|⏵⏵|shift\+tab to cycle)", re.I)
+_CLAUDE_ECHO = re.compile(r"^\s*[>❯]\s*(.*)$")
+_CLAUDE_CHROME = re.compile(
+    r"(\? for shortcuts|esc to interrupt|bypass permissions|⏵⏵|shift\+tab to cycle|ctrl\+o to expand"
+    r"|^\s*[✢✳✻✽]\s+\S.*\bfor\s+\d+s\.?\s*$)", re.I)
 
 
 def _first_line(prompt: str) -> str:
@@ -548,6 +550,19 @@ class Bridge:
                          "--cwd", cwd, "--label", name, "--no-focus")["result"]
         return res["tab"]["tab_id"], res["root_pane"]["pane_id"]
 
+    def _await_shell_ready(self, pane_id: str, wait_s: float = 70, poll_s: float = 0.3) -> None:
+        """A just-created pane's shell may still be mid-startup with something other than a
+        plain shell in the foreground; `agent start` fails immediately with `agent_pane_busy`
+        in that case instead of waiting. One observed cause: a workspace's root pane and its
+        first tab both get fresh shells at nearly the same moment, and if both independently
+        run `pyenv rehash` on startup they collide on pyenv's shim lock file — the loser just
+        retries every 0.1s until pyenv's own ~60s timeout gives up. `wait_s` is set to clear
+        that worst case. Poll until the pane settles into a plain shell, or give up after
+        `wait_s` and let `agent start` raise its own error."""
+        deadline = time.time() + wait_s
+        while not self.pane_is_shell(pane_id) and time.time() < deadline:
+            time.sleep(poll_s)
+
     # --- session identity ---------------------------------------------------
     def record_session(self, name: str, agent: dict) -> None:
         sess = (agent.get("agent_session") or {}).get("value")
@@ -578,7 +593,7 @@ class Bridge:
 
     # --- lifecycle ------------------------------------------------------------
     def start(self, name: str, launch_args: list, fresh: bool = False, resume_flag: str = "--resume",
-              cwd: str | None = None) -> dict:
+              cwd: str | None = None, busy_wait_s: float = 10) -> dict:
         kind, obj = self.resolve(name)
         if kind == "live":
             self.record_session(name, obj)
@@ -592,18 +607,30 @@ class Bridge:
         else:
             tab_id, pane_id = self._create_tab(name, cwd or st.get("cwd") or self.cfg.default_cwd)
             self.store.save(name, tab_id=tab_id, pane_id=pane_id, cwd=cwd or st.get("cwd") or self.cfg.default_cwd)
+            self._await_shell_ready(pane_id)
         args = list(launch_args)
         if st.get("agent_session_id"):
             args += [resume_flag, st["agent_session_id"]]
-        try:
-            res = self.h.cli("agent", "start", name, "--kind", self.cfg.kind, "--pane", pane_id,
-                             "--timeout", str(self.cfg.start_timeout_ms), "--", *args,
-                             timeout_s=self.cfg.start_timeout_ms / 1000.0 + 30)["result"]
-            agent = res["agent"]
-        except HerdrError as e:
-            if e.herdr_code != "agent_not_ready":
-                raise
-            agent = self.find_agent(name) or {"pane_id": pane_id, "name": name, "agent_status": "blocked"}
+        # _await_shell_ready() above is only a heuristic snapshot; herdr's own busy check at the
+        # moment `agent start` actually fires is the authoritative one and can still lose a brief
+        # race (observed live: the pane looked like a plain shell an instant before agent_pane_busy
+        # came back anyway). Retry the call itself on that specific error for a bit before giving up.
+        busy_deadline = time.time() + busy_wait_s
+        while True:
+            try:
+                res = self.h.cli("agent", "start", name, "--kind", self.cfg.kind, "--pane", pane_id,
+                                 "--timeout", str(self.cfg.start_timeout_ms), "--", *args,
+                                 timeout_s=self.cfg.start_timeout_ms / 1000.0 + 30)["result"]
+                agent = res["agent"]
+                break
+            except HerdrError as e:
+                if e.herdr_code == "agent_pane_busy" and time.time() < busy_deadline:
+                    time.sleep(0.3)
+                    continue
+                if e.herdr_code != "agent_not_ready":
+                    raise
+                agent = self.find_agent(name) or {"pane_id": pane_id, "name": name, "agent_status": "blocked"}
+                break
         self.record_session(name, agent)
         return agent
 
