@@ -24,10 +24,18 @@ class LaunchArgTests(unittest.TestCase):
 
     def test_read_only_and_model(self):
         self.assertEqual(cli.build_launch_args(True, "opus"),
-                         ["--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED, "--model", "opus"])
+                         ["--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED]
+                         + cli.READ_ONLY_MCP + ["--model", "opus"])
+
+    def test_read_only_disables_inherited_mcp_servers(self):
+        args = cli.build_launch_args(True, None)
+        self.assertIn("--strict-mcp-config", args)
+        i = args.index("--strict-mcp-config")
+        self.assertEqual(args[i:i + 3], ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
 
     def test_flags_match(self):
-        argv = ["node", "/x/claude", "--resume", "abc", "--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED]
+        argv = (["node", "/x/claude", "--resume", "abc", "--allowedTools", cli.READ_ONLY_ALLOWED,
+                  "--disallowedTools", cli.READ_ONLY_DENIED] + cli.READ_ONLY_MCP)
         self.assertTrue(cli.flags_match(cli.build_launch_args(True, None), argv))
         self.assertFalse(cli.flags_match(cli.build_launch_args(True, None), ["node", "/x/claude", "--resume", "abc"]))
         self.assertTrue(cli.flags_match([], ["claude", "--resume", "abc"]))
@@ -40,12 +48,13 @@ class OpenAskTests(unittest.TestCase):
                        "tab create": [ok("tab_created", tab={"tab_id": "w2:t1"}, root_pane={"pane_id": "w2:p1"})],
                        "agent start": [ok("agent_started", agent=cagent(session="C1"))],
                        "pane process-info": [READY_SHELL,
-                           ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude", "--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED]}]})]})
+                           ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude", "--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED] + cli.READ_ONLY_MCP}]})]})
         rc, out, _, store = run(["open", "cv", "--cwd", "/tmp", "--read-only"], h)
         self.assertEqual(rc, 0)
         start = [c for c in h.calls if c[:3] == ("cli", "agent", "start")][0]
         self.assertEqual(start[3:8], ("cv", "--kind", "claude", "--pane", "w2:p1"))
-        self.assertEqual(start[start.index("--") + 1:], ("--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED))
+        self.assertEqual(start[start.index("--") + 1:],
+                          tuple(["--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED] + cli.READ_ONLY_MCP))
         tab = [c for c in h.calls if c[:3] == ("cli", "tab", "create")][0]
         self.assertIn("/tmp", tab)
         self.assertEqual(store.load("cv")["launch_flags"], cli.build_launch_args(True, None))
@@ -101,7 +110,7 @@ class OpenAskTests(unittest.TestCase):
     def test_open_read_only_on_live_read_only_session_is_ok(self):
         h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
                        "agent list": [ok("agent_list", agents=[cagent()])],
-                       "pane process-info": [ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude", "--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED]}]})]})
+                       "pane process-info": [ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude", "--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED] + cli.READ_ONLY_MCP}]})]})
         store = hb.StateStore(tempfile.mkdtemp()); store.save("cv", launch_flags=cli.build_launch_args(True, None), pane_id="w2:p1")
         rc, out, _, _ = run(["open", "cv", "--read-only"], h, store)
         self.assertEqual(rc, 0)

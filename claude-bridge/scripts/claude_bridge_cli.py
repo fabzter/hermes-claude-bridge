@@ -12,6 +12,10 @@ SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_DIR = os.path.join(SKILL_DIR, "state")
 READ_ONLY_ALLOWED = "Read,Grep,Glob,WebSearch,WebFetch"
 READ_ONLY_DENIED = "Bash,Edit,Write,MultiEdit,NotebookEdit"
+# MCP servers configured in the user's Claude settings load regardless of --allowedTools/
+# --disallowedTools (observed live: a read-only session still had a Bash-capable MCP tool).
+# --strict-mcp-config + an empty --mcp-config JSON blob disables all of them for read-only sessions.
+READ_ONLY_MCP = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
 CLAUDE_CFG = hb.BridgeConfig(workspace_label="claude-bridge", kind="claude",
                              default_cwd=os.path.expanduser("~"), exit_command="/exit")
 
@@ -27,7 +31,7 @@ def default_bridge_factory():
 def build_launch_args(read_only: bool, model: str | None) -> list:
     args = []
     if read_only:
-        args += ["--allowedTools", READ_ONLY_ALLOWED, "--disallowedTools", READ_ONLY_DENIED]
+        args += ["--allowedTools", READ_ONLY_ALLOWED, "--disallowedTools", READ_ONLY_DENIED] + READ_ONLY_MCP
     if model:
         args += ["--model", model]
     return args
