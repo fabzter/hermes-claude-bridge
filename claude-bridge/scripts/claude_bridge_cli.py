@@ -11,7 +11,7 @@ import herdrbridge as hb
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_DIR = os.path.join(SKILL_DIR, "state")
 READ_ONLY_ALLOWED = "Read,Grep,Glob,WebSearch,WebFetch"
-READ_ONLY_DENIED = "Bash,Edit,Write,MultiEdit,NotebookEdit"
+READ_ONLY_DENIED = "Bash,Edit,Write,NotebookEdit"
 # MCP servers configured in the user's Claude settings load regardless of --allowedTools/
 # --disallowedTools (observed live: a read-only session still had a Bash-capable MCP tool).
 # --strict-mcp-config + an empty --mcp-config JSON blob disables all of them for read-only sessions.
