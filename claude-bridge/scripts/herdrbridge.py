@@ -21,6 +21,11 @@ SESSION_DEFAULT = "agents"
 SESSION_NAME = SESSION_DEFAULT
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
+# Indirected through module-level names (rather than called as time.sleep/time.time directly)
+# so tests can patch hb._sleep/hb._now to drive deadline loops without real waiting.
+_sleep = time.sleep
+_now = time.time
+
 EXIT_OK, EXIT_ERROR, EXIT_MISSING, EXIT_APPROVAL, EXIT_SECRET = 0, 1, 2, 3, 4
 EXIT_CLARIFY, EXIT_TIMEOUT, EXIT_DEAD, EXIT_BUSY, EXIT_SERVER = 5, 6, 7, 8, 9
 
@@ -78,6 +83,24 @@ def validate_name(name: str) -> str:
             "invalid session name %r: must match [a-z][a-z0-9_-]{0,31} "
             "(lowercase letters, digits, '_' and '-', max 32 chars, letter first)" % (name,))
     return name
+
+
+def rotate_log(path: str, max_bytes: int = 5 * 1024 * 1024, keep: int = 2) -> bool:
+    """Rotate `path` to `.1`, `.1` to `.2`, … when it exceeds `max_bytes`. Returns True if rotated.
+    `keep < 1` is a no-op (returns False) since there'd be nowhere to rotate `path` to."""
+    if keep < 1:
+        return False
+    try:
+        if os.path.getsize(path) <= max_bytes:
+            return False
+    except OSError:
+        return False
+    for i in range(keep, 0, -1):
+        src = path if i == 1 else "%s.%d" % (path, i - 1)
+        dst = "%s.%d" % (path, i)
+        if os.path.exists(src):
+            os.replace(src, dst)
+    return True
 
 
 class Herdr:
@@ -216,17 +239,18 @@ class Herdr:
             pass
         log_dir = os.path.dirname(self.socket_path)
         os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, "herdr-server.log")
+        log_path = os.path.join(log_dir, "herdr-server.spawn.log")
+        rotate_log(log_path)
         with open(log_path, "ab") as log:
             self._spawner([self.bin, "server"], env=self.env(), stdin=subprocess.DEVNULL,
                           stdout=log, stderr=log, start_new_session=True)
-        deadline = time.time() + wait_s
-        while time.time() < deadline:
+        deadline = _now() + wait_s
+        while _now() < deadline:
             try:
                 self.ping()
                 return
             except (OSError, HerdrError, ValueError, ServerUnavailable):
-                time.sleep(poll_s)
+                _sleep(poll_s)
         raise ServerUnavailable("herdr server for session %r did not answer within %ss (log: %s)"
                                 % (self.session, wait_s, log_path))
 
@@ -325,6 +349,21 @@ def classify(agent_status: str | None, matched_rule_id: str | None) -> str:
 
 def state_exit(state: str) -> int:
     return STATE_EXIT.get(state, EXIT_ERROR)
+
+
+# Reverse of `classify()`, used by `Bridge.wait_status`'s polling fallback to decide whether a
+# bridge state satisfies an `until` set expressed in herdr's own vocabulary ("idle", "done",
+# "working", "blocked", "unknown"). "dead"/"missing" have no herdr status: they're handled as an
+# immediate failure by the caller instead of being looked up here.
+BRIDGE_TO_HERDR_STATUS = {
+    "idle": ("idle", "done"),
+    "busy": ("working",),
+    "approval": ("blocked",),
+    "secret": ("blocked",),
+    "clarify": ("blocked",),
+    "blocked": ("blocked",),
+    "unknown": ("unknown",),
+}
 
 
 # --- reply extraction for Hermes REPL and Claude alt-screen reads --------
@@ -553,8 +592,8 @@ class Bridge:
         self._ws = None
 
     # --- topology ----------------------------------------------------------
-    def workspace(self) -> dict:
-        if self._ws:
+    def workspace(self, refresh: bool = False) -> dict:
+        if self._ws and not refresh:
             return self._ws
         for ws in self.h.cli("workspace", "list")["result"].get("workspaces", []):
             if ws.get("label") == self.cfg.workspace_label:
@@ -565,17 +604,40 @@ class Bridge:
         self._ws = res["workspace"]
         return self._ws
 
+    def invalidate_workspace(self) -> None:
+        self._ws = None
+
+    def _with_workspace_retry(self, fn, codes: tuple = ("workspace_not_found", "not_found")):
+        """Run `fn(workspace_id)`; if it fails because the cached workspace vanished (one of
+        `codes`), drop the cache and retry once with the refreshed id. A second such failure
+        propagates, as does any error whose code isn't in `codes`."""
+        try:
+            return fn(self.workspace()["workspace_id"])
+        except HerdrError as e:
+            if e.herdr_code not in codes:
+                raise
+            self.invalidate_workspace()
+            return fn(self.workspace()["workspace_id"])
+
     def tabs(self) -> list:
-        return self.h.cli("tab", "list", "--workspace", self.workspace()["workspace_id"])["result"].get("tabs", [])
+        return self._with_workspace_retry(
+            lambda ws_id: self.h.cli("tab", "list", "--workspace", ws_id)["result"].get("tabs", []))
 
     def panes(self) -> list:
-        return self.h.cli("pane", "list", "--workspace", self.workspace()["workspace_id"])["result"].get("panes", [])
+        return self._with_workspace_retry(
+            lambda ws_id: self.h.cli("pane", "list", "--workspace", ws_id)["result"].get("panes", []))
 
     def agents(self) -> list:
-        ws = self.workspace()["workspace_id"]
-        return [a for a in self.h.cli("agent", "list")["result"].get("agents", []) if a.get("workspace_id") == ws]
+        # `agent list` isn't scoped to a workspace, so `not_found` from it means something
+        # else vanished (e.g. the agent itself), not the cached workspace — retry only on
+        # `workspace_not_found` so that unrelated `not_found`s propagate instead of masking
+        # themselves behind a pointless `workspace list` refresh.
+        def _fn(ws_id):
+            return [a for a in self.h.cli("agent", "list")["result"].get("agents", []) if a.get("workspace_id") == ws_id]
+        return self._with_workspace_retry(_fn, codes=("workspace_not_found",))
 
     def find_agent(self, name: str) -> dict | None:
+        validate_name(name)
         matches = [a for a in self.agents() if a.get("name") == name]
         if len(matches) > 1:
             raise BridgeError("multiple live agents named %r; refusing to guess" % name, EXIT_ERROR)
@@ -600,9 +662,11 @@ class Bridge:
         return bool(fg) and all(os.path.basename(str(p.get("name", ""))) in SHELL_NAMES for p in fg)
 
     def _create_tab(self, name: str, cwd: str) -> tuple:
-        res = self.h.cli("tab", "create", "--workspace", self.workspace()["workspace_id"],
-                         "--cwd", cwd, "--label", name, "--no-focus")["result"]
-        return res["tab"]["tab_id"], res["root_pane"]["pane_id"]
+        def _fn(ws_id):
+            res = self.h.cli("tab", "create", "--workspace", ws_id,
+                             "--cwd", cwd, "--label", name, "--no-focus")["result"]
+            return res["tab"]["tab_id"], res["root_pane"]["pane_id"]
+        return self._with_workspace_retry(_fn)
 
     def _await_shell_ready(self, pane_id: str) -> None:
         """A just-created pane's shell may still be mid-startup with something other than a
@@ -618,12 +682,13 @@ class Bridge:
         (`pane_info` returns None) — there's nothing left to settle."""
         if self.pane_info(pane_id) is None:
             return
-        deadline = time.time() + self.cfg.shell_settle_s
-        while not self.pane_is_shell(pane_id) and time.time() < deadline:
-            time.sleep(self.cfg.poll_s)
+        deadline = _now() + self.cfg.shell_settle_s
+        while not self.pane_is_shell(pane_id) and _now() < deadline:
+            _sleep(self.cfg.poll_s)
 
     # --- session identity ---------------------------------------------------
     def record_session(self, name: str, agent: dict) -> None:
+        validate_name(name)
         sess = (agent.get("agent_session") or {}).get("value")
         fields = {}
         if agent.get("pane_id"):
@@ -637,6 +702,7 @@ class Bridge:
         self.store.save(name, **fields)
 
     def resolve(self, name: str):
+        validate_name(name)
         a = self.find_agent(name)
         if a:
             return "live", a
@@ -645,7 +711,7 @@ class Bridge:
         if pane_id:
             info = self.pane_info(pane_id)
             if (info and not info.get("agent")
-                    and info.get("workspace_id") == self.workspace()["workspace_id"]
+                    and info.get("workspace_id") == self._with_workspace_retry(lambda ws_id: ws_id)
                     and self.pane_is_shell(pane_id)):
                 return "restorable", pane_id
         return "missing", None
@@ -658,6 +724,7 @@ class Bridge:
         created: the shell-settle wait (`self.cfg.shell_settle_s`) + `busy_wait_s` of
         `agent_pane_busy` retries + one `agent start` call bounded by `self.cfg.start_timeout_ms`
         plus a 30s margin."""
+        validate_name(name)
         kind, obj = self.resolve(name)
         if kind == "live":
             self.record_session(name, obj)
@@ -693,9 +760,9 @@ class Bridge:
                     # before we ever called `agent start` — a slow first attempt shouldn't eat
                     # into the retry budget.
                     if busy_deadline is None:
-                        busy_deadline = time.time() + busy_wait_s
-                    if time.time() < busy_deadline:
-                        time.sleep(self.cfg.poll_s)
+                        busy_deadline = _now() + busy_wait_s
+                    if _now() < busy_deadline:
+                        _sleep(self.cfg.poll_s)
                         continue
                     raise
                 if e.herdr_code != "agent_not_ready":
@@ -706,6 +773,7 @@ class Bridge:
         return agent
 
     def explain_rule(self, name: str) -> str | None:
+        validate_name(name)
         try:
             out = self.h.cli("agent", "explain", name, "--json")
         except HerdrError:
@@ -718,6 +786,7 @@ class Bridge:
         return None
 
     def state(self, name: str):
+        validate_name(name)
         a = self.find_agent(name)
         if a:
             status = a.get("agent_status")
@@ -730,16 +799,64 @@ class Bridge:
 
     # --- I/O --------------------------------------------------------------------
     def read(self, name: str, lines: int | None = None, source: str = "recent-unwrapped") -> str:
+        validate_name(name)
         return self.h.cli_text("agent", "read", name, "--source", source, "--lines", str(lines or self.cfg.read_lines))
 
     def visible(self, name: str) -> str:
+        validate_name(name)
         return self.h.cli_text("agent", "read", name, "--source", "visible")
 
     def wait(self, name: str, timeout_ms: int):
+        validate_name(name)
         self.h.cli("agent", "wait", name, "--timeout", str(timeout_ms), timeout_s=timeout_ms / 1000.0 + 30)
         return self.state(name)
 
+    def wait_status(self, name: str, until: tuple = ("idle", "done", "blocked"),
+                    timeout_ms: int = 600000, poll_s: float = 2.0) -> tuple:
+        """Wait for `name` to reach one of the herdr-vocabulary statuses in `until`
+        ("idle", "done", "working", "blocked", "unknown"), preferring herdr's own server-side
+        `agent wait` (cheap, event-driven). If that call itself fails for a reason unrelated to
+        the wait outcome — the socket closed mid-call, herdr returned non-JSON, the server isn't
+        running, or any other `HerdrError`/`OSError`/`ServerUnavailable` besides a genuine
+        `timeout` or the agent being gone (`agent_not_found`/`agent_not_running`, which are
+        re-raised as-is) — fall back to polling `self.state()` every `poll_s` (floored to at
+        least 0.05s, so `poll_s=0` can't busy-spin) until it maps onto `until` or `timeout_ms`
+        elapses. The deadline for that fallback is anchored before the primary `agent wait`
+        call, so the two share one `timeout_ms` budget instead of the fallback getting a fresh
+        `timeout_ms` on top of whatever `agent wait` already spent. Returns `self.state(name)`."""
+        validate_name(name)
+        until_set = set(until)
+        deadline = _now() + timeout_ms / 1000.0
+        try:
+            self.h.cli("agent", "wait", name, *[x for u in until for x in ("--until", u)],
+                       "--timeout", str(timeout_ms), timeout_s=timeout_ms / 1000.0 + 30)
+            return self.state(name)
+        except HerdrError as e:
+            if e.herdr_code == "timeout":
+                raise BridgeError(
+                    "timed out after %dms waiting for %r to reach %s" % (timeout_ms, name, sorted(until_set)),
+                    EXIT_TIMEOUT)
+            if e.herdr_code in ("agent_not_found", "agent_not_running"):
+                raise
+            # any other herdr-level failure (closed, bad_json, error, server_not_running, ...):
+            # the wait itself is unreliable, not the outcome — fall back to polling below.
+        except (OSError, ServerUnavailable):
+            pass
+        while True:
+            state, agent = self.state(name)
+            if state in ("dead", "missing"):
+                raise BridgeError("session %r is %s while waiting for it to reach %s"
+                                  % (name, state, sorted(until_set)), state_exit(state) or EXIT_ERROR)
+            if until_set & set(BRIDGE_TO_HERDR_STATUS.get(state, ())):
+                return state, agent
+            if _now() >= deadline:
+                raise BridgeError(
+                    "timed out after %dms polling for %r to reach %s (herdr socket was unavailable)"
+                    % (timeout_ms, name, sorted(until_set)), EXIT_TIMEOUT)
+            _sleep(max(poll_s, 0.05))
+
     def send(self, name: str, text: str, timeout_ms: int):
+        validate_name(name)
         state, agent = self.state(name)
         if state != "idle":
             raise BridgeError("session %r is %s; refusing to send" % (name, state), state_exit(state) or EXIT_ERROR)
@@ -767,19 +884,24 @@ class Bridge:
         reply, truncated = extract_reply(before, after, text, self.cfg.kind)
         return state, reply, truncated, dialog
 
-    def answer(self, name: str, text: str, settle_s: float = 1.0) -> str:
+    def answer(self, name: str, text: str, settle_s: float = 5.0, poll_s: float = 0.25) -> str:
+        validate_name(name)
         state, agent = self.state(name)
         if state != "clarify":
             raise BridgeError("session %r is %s, not clarify; refusing to answer" % (name, state), state_exit(state) or EXIT_ERROR)
         self.h.cli("pane", "send-text", agent["pane_id"], text)
         self.h.cli("pane", "send-keys", agent["pane_id"], "enter")
-        time.sleep(settle_s)
-        new_state, _ = self.state(name)
-        if new_state == "clarify":
-            raise BridgeError("answer to %r did not register; agent still in clarify" % name, EXIT_CLARIFY)
-        return new_state
+        deadline = _now() + settle_s
+        while True:
+            _sleep(poll_s)
+            new_state, _ = self.state(name)
+            if new_state != "clarify":
+                return new_state
+            if _now() >= deadline:
+                raise BridgeError("answer to %r did not register; agent still in clarify" % name, EXIT_CLARIFY)
 
     def navigate_menu(self, name: str, target_label: str, max_steps: int = 8, settle_s: float = 0.4) -> str:
+        validate_name(name)
         state, _ = self.state(name)
         if state != "approval":
             raise BridgeError("session %r is %s, not approval; refusing" % (name, state), state_exit(state) or EXIT_ERROR)
@@ -788,12 +910,13 @@ class Bridge:
             if step is None:
                 raise BridgeError("approval menu not recognized or %r not found exactly once; refusing to act" % target_label)
             self.h.cli("agent", "send-keys", name, step)
-            time.sleep(settle_s)
+            _sleep(settle_s)
             if step == "enter":
                 return self.state(name)[0]
         raise BridgeError("could not reach %r within %d keystrokes; refusing" % (target_label, max_steps))
 
     def stop(self, name: str, wait_s: float = 15) -> bool:
+        validate_name(name)
         a = self.find_agent(name)
         tab_id = None
         if a:
@@ -804,9 +927,9 @@ class Bridge:
                 if e.herdr_code not in ("agent_not_running", "agent_not_found", "agent_blocked",
                                         "agent_prompt_stalled", "timeout"):
                     raise
-            deadline = time.time() + wait_s
-            while time.time() < deadline and self.find_agent(name):
-                time.sleep(0.5)
+            deadline = _now() + wait_s
+            while _now() < deadline and self.find_agent(name):
+                _sleep(0.5)
         else:
             st = self.store.load(name)
             if st.get("pane_id") and self.pane_info(st["pane_id"]):

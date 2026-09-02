@@ -61,6 +61,14 @@ class LaunchArgTests(unittest.TestCase):
         stored = ["--permission-mode", "manual", "--model", "opus"]
         self.assertTrue(cli.flags_match(stored, argv))
 
+    def test_flags_match_true_with_real_executable_argv_shape(self):
+        # Live argv as herdr/psutil actually report it for a real Claude Code launch: argv[0] is
+        # the executable itself (a Homebrew-installed binary), not a "node" wrapper in front of a
+        # separate script path -- _find_claude_argv_tail must still locate "claude" at index 0.
+        argv = ["/opt/homebrew/Caskroom/claude-code/2.1.236/claude", "--permission-mode", "manual",
+                "--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED] + cli.READ_ONLY_MCP
+        self.assertTrue(cli.flags_match(cli.build_launch_args(True, None), argv))
+
     def test_flags_match_pair_aware_not_token_containment(self):
         # A stale --model value token can coincidentally reappear elsewhere in the live argv (here
         # as the value of an unrelated flag); naive token-containment would false-positive-match on
@@ -367,6 +375,26 @@ class OpenAskTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertNotIn("--read-only", err)
         self.assertIn("close cv", err); self.assertIn("open cv", err)
+
+    def test_remediation_suffix_flags_read_only_when_only_mcp_config_missing(self):
+        # The read-only bundle is 4 flag pairs (--allowedTools/--disallowedTools/
+        # --strict-mcp-config/--mcp-config); a live session that dropped only one of them (e.g.
+        # herdr's restore losing just --mcp-config) is still a broken read-only session and must
+        # still be told to pass --read-only again, not silently omitted because --allowedTools
+        # itself happened to survive.
+        missing = {"--mcp-config": '{"mcpServers":{}}'}
+        self.assertIn("--read-only", cli._remediation_suffix(missing))
+
+    def test_ask_refuses_with_read_only_hint_when_only_mcp_config_flag_missing(self):
+        argv = ["node", "/x/claude", "--resume", "C1", "--permission-mode", "manual",
+                "--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED,
+                "--strict-mcp-config"]  # --mcp-config (and its value) dropped by the restore
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent()])],
+                       "pane process-info": [ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": argv}]})]})
+        store = hb.StateStore(tempfile.mkdtemp()); store.save("cv", launch_flags=cli.build_launch_args(True, None), pane_id="w2:p1")
+        rc, _, err, _ = run(["ask", "cv", "hello"], h, store)
+        self.assertEqual(rc, 1); self.assertIn("--read-only", err); self.assertIn("close", err)
 
     def test_open_live_session_model_value_mismatch_lists_flag_value_pair(self):
         h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],

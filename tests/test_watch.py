@@ -114,5 +114,110 @@ class PidfileTests(unittest.TestCase):
         self.assertIsNone(w._running_pid(d))
 
 
+class FakeProc:
+    def __init__(self, pid=4242):
+        self.pid = pid
+
+
+class StartLogRotationTests(unittest.TestCase):
+    def test_start_rotates_an_oversized_watch_log_before_reopening_it(self):
+        d = tempfile.mkdtemp()
+        wh.save_config(d, wh.WebhookConfig("claude-bridge", "k", "http://127.0.0.1:8644/webhooks/claude-bridge"))
+        log_path = os.path.join(d, "watch.log")
+        with open(log_path, "wb") as f:
+            f.write(b"x" * (6 * 1024 * 1024))
+        rotated_path = log_path + ".1"
+        self.assertFalse(os.path.exists(rotated_path))
+
+        calls = []
+
+        def fake_popen(*args, **kwargs):
+            calls.append((args, kwargs))
+            return FakeProc(pid=4242)
+
+        orig_popen = w._popen
+        w._popen = fake_popen
+        try:
+            out, err = io.StringIO(), io.StringIO()
+            rc = w.command("start", d, lambda: None, out, err)
+        finally:
+            w._popen = orig_popen
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)  # no real process was spawned
+        self.assertTrue(os.path.exists(rotated_path))
+        self.assertEqual(os.path.getsize(rotated_path), 6 * 1024 * 1024)
+        # the log path itself must be a fresh (small) file after rotation, ready for the new run
+        self.assertLess(os.path.getsize(log_path), 6 * 1024 * 1024)
+        self.assertIn("4242", out.getvalue())
+
+
+class WatcherLogRotationTests(unittest.TestCase):
+    def make(self, agents, log_path, rotator=None):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "pane list": [ok("pane_list", panes=[{"pane_id": a["pane_id"], "tab_id": "w2:t1"} for a in agents])],
+                       "agent list": [ok("agent_list", agents=agents)],
+                       "agent explain": [{"matched_rule": {"id": "bash_permission_prompt"}}]},
+                      {"agent read": ["Do you want to proceed?\n❯ 1. Yes\n"]})
+        b = hb.Bridge(h, cli.CLAUDE_CFG, hb.StateStore(tempfile.mkdtemp()))
+        cfg = wh.WebhookConfig("claude-bridge", "k", "http://127.0.0.1:8644/webhooks/claude-bridge")
+        watcher = w.Watcher(b, cfg, poster=lambda c, p: 200, log=io.StringIO(), log_path=log_path, rotator=rotator)
+        return watcher
+
+    def test_rotate_log_invoked_every_500_handled_events(self):
+        d = tempfile.mkdtemp()
+        log_path = os.path.join(d, "watch.log")
+        rotate_calls = []
+
+        def fake_rotator(path):
+            rotate_calls.append(path)
+            return False
+
+        watcher = self.make([cagent()], log_path, rotator=fake_rotator)
+        env = {"event": "pane.created", "data": {"pane_id": "w2:p9", "workspace_id": "w2"}}
+        for _ in range(500):
+            watcher.handle(env)
+        self.assertEqual(rotate_calls, [log_path])
+
+        for _ in range(499):
+            watcher.handle(env)
+        self.assertEqual(rotate_calls, [log_path])  # not yet at the next 500 boundary
+        watcher.handle(env)
+        self.assertEqual(rotate_calls, [log_path, log_path])
+
+    def test_rotate_log_not_invoked_without_log_path(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "pane list": [ok("pane_list", panes=[{"pane_id": "w2:p1", "tab_id": "w2:t1"}])],
+                       "agent list": [ok("agent_list", agents=[cagent()])]}, {})
+        b = hb.Bridge(h, cli.CLAUDE_CFG, hb.StateStore(tempfile.mkdtemp()))
+        cfg = wh.WebhookConfig("claude-bridge", "k", "http://127.0.0.1:8644/webhooks/claude-bridge")
+        rotate_calls = []
+        watcher = w.Watcher(b, cfg, poster=lambda c, p: 200, log=io.StringIO(), rotator=lambda p: rotate_calls.append(p))
+        env = {"event": "pane.created", "data": {"pane_id": "w2:p9", "workspace_id": "w2"}}
+        for _ in range(500):
+            watcher.handle(env)
+        self.assertEqual(rotate_calls, [])
+
+    def test_rotate_log_uses_module_level_hb_rotate_log_by_default(self):
+        d = tempfile.mkdtemp()
+        log_path = os.path.join(d, "watch.log")
+        watcher = self.make([cagent()], log_path)  # no rotator injected
+        env = {"event": "pane.created", "data": {"pane_id": "w2:p9", "workspace_id": "w2"}}
+        orig = hb.rotate_log
+        calls = []
+
+        def fake(path, *a, **kw):
+            calls.append(path)
+            return False
+
+        hb.rotate_log = fake
+        try:
+            for _ in range(500):
+                watcher.handle(env)
+        finally:
+            hb.rotate_log = orig
+        self.assertEqual(calls, [log_path])
+
+
 if __name__ == "__main__":
     unittest.main()

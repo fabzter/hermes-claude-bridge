@@ -11,6 +11,11 @@ import time
 import herdrbridge as hb
 import claude_bridge_webhook as wh
 
+# Indirected through a module-level name (rather than calling subprocess.Popen directly) so tests
+# can inject a fake via `w._popen = ...` and exercise `command("start")` without spawning a real
+# process.
+_popen = subprocess.Popen
+
 
 def should_forward(prev: str | None, new: str) -> bool:
     if new == "blocked":
@@ -21,15 +26,40 @@ def should_forward(prev: str | None, new: str) -> bool:
 
 
 class Watcher:
-    def __init__(self, bridge: hb.Bridge, cfg: wh.WebhookConfig, poster=wh.post_webhook, log=None):
+    def __init__(self, bridge: hb.Bridge, cfg: wh.WebhookConfig, poster=wh.post_webhook, log=None,
+                 log_path: str | None = None, rotator=None):
         self.b, self.cfg, self.poster = bridge, cfg, poster
-        self.log = log or sys.stderr
+        self.log_path = log_path
+        # Own the file handle only when the caller didn't hand us one explicitly (e.g. sys.stderr,
+        # or a StringIO in tests) -- only a handle we opened ourselves is safe to close and reopen
+        # on rotation.
+        self._owns_log = log is None and log_path is not None
+        self.log = log if log is not None else (open(log_path, "a") if log_path else sys.stderr)
+        self.rotator = rotator
         self.prev = {}
         self.resubscribe_requested = False
+        self._handled = 0
 
     def _log(self, msg: str) -> None:
         self.log.write("%s %s\n" % (datetime.datetime.now().strftime("%H:%M:%S"), msg))
         self.log.flush()
+
+    def _maybe_rotate_log(self) -> None:
+        """Called once per handled event; every 500th event, rotate `self.log_path` if it has
+        grown past the size threshold and, when we own the file handle (see __init__), reopen it
+        so subsequent writes land in the fresh post-rotation file rather than the renamed one."""
+        if not self.log_path:
+            return
+        self._handled += 1
+        if self._handled % 500 != 0:
+            return
+        rotate = self.rotator or hb.rotate_log
+        if rotate(self.log_path) and self._owns_log:
+            try:
+                self.log.close()
+            except Exception:
+                pass
+            self.log = open(self.log_path, "a")
 
     def subscriptions(self) -> list:
         subs = [{"type": "pane.agent_status_changed", "pane_id": p["pane_id"]} for p in self.b.panes()]
@@ -40,6 +70,7 @@ class Watcher:
         return self.b.workspace()["workspace_id"]
 
     def handle(self, envelope: dict):
+        self._maybe_rotate_log()
         kind = envelope.get("event") or envelope.get("type") or ""
         data = envelope.get("data") or envelope
         if data.get("workspace_id") not in (None, self._ws_id()):
@@ -139,13 +170,15 @@ def command(action: str, state_dir: str, bridge_factory, out, err) -> int:
         if not cfg:
             err.write("claude-bridge: no webhook configured; run `setup-webhook` first\n")
             return 1
-        log = open(os.path.join(state_dir, "watch.log"), "ab")
+        log_path = os.path.join(state_dir, "watch.log")
+        hb.rotate_log(log_path)
+        log = open(log_path, "ab")
         launcher = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claude-bridge")
-        proc = subprocess.Popen([sys.executable, launcher, "watch", "run"], stdin=subprocess.DEVNULL,
-                                stdout=log, stderr=log, start_new_session=True, env=dict(os.environ))
+        proc = _popen([sys.executable, launcher, "watch", "run"], stdin=subprocess.DEVNULL,
+                      stdout=log, stderr=log, start_new_session=True, env=dict(os.environ))
         with open(_pidfile(state_dir), "w") as f:
             f.write(str(proc.pid))
-        out.write("watcher started (pid %d), log: %s\n" % (proc.pid, os.path.join(state_dir, "watch.log")))
+        out.write("watcher started (pid %d), log: %s\n" % (proc.pid, log_path))
         return 0
     if action == "run":
         cfg = wh.load_config(state_dir)
@@ -154,8 +187,10 @@ def command(action: str, state_dir: str, bridge_factory, out, err) -> int:
             return 1
         with open(_pidfile(state_dir), "w") as f:
             f.write(str(os.getpid()))
+        log_path = os.path.join(state_dir, "watch.log")
+        hb.rotate_log(log_path)
         b = bridge_factory()
-        Watcher(b, cfg, log=sys.stderr).run_forever()
+        Watcher(b, cfg, log_path=log_path).run_forever()
         return 0
     err.write("claude-bridge: unknown watch action %r\n" % action)
     return 2

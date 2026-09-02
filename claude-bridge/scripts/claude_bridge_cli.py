@@ -101,8 +101,14 @@ def merge_launch_args(stored: list, requested: list) -> list:
     return out
 
 
+# The 4 flag pairs build_launch_args emits together for --read-only; any one of them missing
+# means the read-only bundle is broken and the remediation hint must still say --read-only, not
+# just when --allowedTools specifically is the one that dropped.
+_READ_ONLY_BUNDLE_FLAGS = ("--allowedTools", "--disallowedTools", "--strict-mcp-config", "--mcp-config")
+
+
 def _is_read_only_flags(flags) -> bool:
-    return "--allowedTools" in flags
+    return any(f in flags for f in _READ_ONLY_BUNDLE_FLAGS)
 
 
 def _find_claude_argv_tail(argv: list) -> list:
