@@ -91,7 +91,7 @@ def post_webhook(cfg: WebhookConfig, payload: dict, opener=None, now=None, timeo
 
 _SECRET_RE = re.compile(r"^\s*Secret:\s*(\S+)\s*$", re.M)
 _SECRET_LINE_RE = re.compile(r"secret\s*:", re.I)
-_ROUTE_URL_RE = re.compile(r"(?:Webhook\s+)?URL:\s*(\S+)")
+_ROUTE_URL_RE = re.compile(r"^\s*(?:Webhook\s+)?URL:\s*(\S+)\s*$", re.M)
 _ROUTE_CONFIRM_RE = re.compile(r"(?:Created|Updated)\s+webhook\s+subscription", re.I)
 
 
@@ -116,6 +116,11 @@ def setup_route(state_dir: str, route: str, deliver: str, secret: str | None = N
     cp = runner(argv, capture_output=True, text=True)
     if cp.returncode != 0:
         detail = _redact_secret_lines((cp.stderr or cp.stdout).strip())
+        if secret:
+            # `secret` (an explicit --secret we passed in) can legitimately show up verbatim in
+            # hermes's own error output (e.g. echoing the argv it rejected) even outside a
+            # "Secret:"-labeled line — scrub the literal value too.
+            detail = detail.replace(secret, "***")
         raise hb.BridgeError("hermes webhook subscribe failed (%d): %s" % (cp.returncode, detail))
     stdout = cp.stdout or ""
     url_match = _ROUTE_URL_RE.search(stdout)
@@ -131,7 +136,14 @@ def setup_route(state_dir: str, route: str, deliver: str, secret: str | None = N
     if not final_secret:
         # Never interpolate `stdout` here: it's the one place the real secret shows up verbatim.
         raise hb.BridgeError("could not read the generated secret from `hermes webhook subscribe` output")
-    url = url_match.group(1) if url_match else "%s/webhooks/%s" % (WEBHOOK_BASE, route)
+    captured_url = url_match.group(1) if url_match else None
+    # A matched `URL:` line still only counts as a route marker if its value actually looks like
+    # a URL — otherwise fall back to the known-good WEBHOOK_BASE, never save whatever garbage
+    # followed "URL:" on that line.
+    if captured_url and (captured_url.startswith("http://") or captured_url.startswith("https://")):
+        url = captured_url
+    else:
+        url = "%s/webhooks/%s" % (WEBHOOK_BASE, route)
     cfg = WebhookConfig(route, final_secret, url)
     save_config(state_dir, cfg)
     return cfg

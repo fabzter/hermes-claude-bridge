@@ -63,6 +63,7 @@ _LAUNCH_FLAG_ORDER = (
     ("--strict-mcp-config", False), ("--mcp-config", True), ("--model", True),
 )
 _LAUNCH_FLAG_TAKES_VALUE = dict(_LAUNCH_FLAG_ORDER)
+_MISSING = object()  # sentinel: distinct from any real flag value, including None (a bare switch)
 
 
 def _parse_launch_pairs(tokens: list) -> dict:
@@ -116,9 +117,21 @@ def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, 
     if kind == "live":
         requested = build_launch_args(read_only, model)
         stored = bridge.store.load(name).get("launch_flags") or []
-        missing = [tok for tok in requested if tok not in stored]
-        if missing:
-            if set(missing) <= set(PERMISSION_MODE_ARGS):
+        # Compare flag-by-flag (value included), not token-by-token: a stored --model with a
+        # different value must count as a mismatch even though the bare token "--model" is
+        # present in both lists.
+        requested_pairs = _parse_launch_pairs(requested)
+        stored_pairs = _parse_launch_pairs(stored)
+        missing_flags = [flag for flag, _ in _LAUNCH_FLAG_ORDER
+                          if flag in requested_pairs
+                          and stored_pairs.get(flag, _MISSING) != requested_pairs[flag]]
+        if missing_flags:
+            missing_tokens = []
+            for flag in missing_flags:
+                missing_tokens.append(flag)
+                if requested_pairs[flag] is not None:
+                    missing_tokens.append(requested_pairs[flag])
+            if set(missing_flags) <= {"--permission-mode"}:
                 # Nothing the caller actually asked for is missing — only the always-pinned
                 # permission-mode pair (e.g. a session predating this pin, or one that lost it
                 # to a herdr restore). Don't imply --read-only/--model were requested when
@@ -131,7 +144,7 @@ def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, 
                 suffix = " --model " + model
             raise hb.BridgeError(
                 "session %r is already running without the requested flags (%s); run `close %s` then "
-                "`open %s%s` to apply them" % (name, " ".join(missing), name, name, suffix), hb.EXIT_ERROR)
+                "`open %s%s` to apply them" % (name, " ".join(missing_tokens), name, name, suffix), hb.EXIT_ERROR)
         agent = bridge.start(name, [], fresh=False, cwd=cwd)
     else:
         # The session isn't live (e.g. the agent process died, or herdr restored it as plain

@@ -121,6 +121,17 @@ class SetupTests(unittest.TestCase):
         self.assertIn("some error", str(ctx.exception))
         self.assertIn("more context", str(ctx.exception))
 
+    def test_setup_route_failure_message_redacts_literal_explicit_secret(self):
+        class CP:
+            returncode = 1
+            stdout = "argv rejected: --secret mine-explicit-secret is malformed\n"
+            stderr = ""
+        import herdrbridge as hb
+        with self.assertRaises(hb.BridgeError) as ctx:
+            wh.setup_route(tempfile.mkdtemp(), "r", "log", "mine-explicit-secret", runner=lambda argv, **kw: CP())
+        self.assertNotIn("mine-explicit-secret", str(ctx.exception))
+        self.assertIn("***", str(ctx.exception))
+
     def test_setup_route_secret_parse_failure_does_not_leak_stdout(self):
         d = tempfile.mkdtemp()
         class CP:
@@ -167,6 +178,35 @@ class SetupTests(unittest.TestCase):
             stderr = ""
         cfg = wh.setup_route(d, "r", "log", None, runner=lambda argv, **kw: CP())
         self.assertEqual(cfg.url, "http://127.0.0.1:9999/webhooks/custom")
+
+    def _setup_route_with_stdout(self, stdout):
+        d = tempfile.mkdtemp()
+        class CP:
+            returncode = 0
+            stderr = ""
+        CP.stdout = stdout
+        return wh.setup_route(d, "claude-bridge", "log", None, runner=lambda argv, **kw: CP())
+
+    def test_docs_url_line_does_not_hijack_route_url(self):
+        cfg = self._setup_route_with_stdout(
+            "Created webhook subscription\nDocs URL: https://example.com/help\nSecret: sekret\n")
+        self.assertEqual(cfg.url, "http://127.0.0.1:8644/webhooks/claude-bridge")
+
+    def test_curl_prefixed_line_does_not_hijack_route_url(self):
+        cfg = self._setup_route_with_stdout(
+            "Created webhook subscription\ncURL: http://evil/x\nSecret: sekret\n")
+        self.assertEqual(cfg.url, "http://127.0.0.1:8644/webhooks/claude-bridge")
+
+    def test_curl_command_line_does_not_hijack_route_url(self):
+        cfg = self._setup_route_with_stdout(
+            "Created webhook subscription\ncurl URL: not-a-url\nSecret: sekret\n")
+        self.assertEqual(cfg.url, "http://127.0.0.1:8644/webhooks/claude-bridge")
+
+    def test_url_line_with_non_http_value_falls_back_but_still_counts_as_marker(self):
+        # No "Created"/"Updated" phrase at all here — only the (non-URL-shaped) `URL:` line
+        # itself must be enough to satisfy the route-confirmation check.
+        cfg = self._setup_route_with_stdout("  URL: not-a-url\n  Secret: sekret\n")
+        self.assertEqual(cfg.url, "http://127.0.0.1:8644/webhooks/claude-bridge")
 
 
 class PromptTemplateTests(unittest.TestCase):

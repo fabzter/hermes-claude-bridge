@@ -31,8 +31,10 @@ trap:
    `/tmp/claude_live_capture.txt` — this becomes the new `tests/fixtures/claude_reply.txt`.
 5. Asks `e2e` (read-only) to run a shell command. `Bash` is in `--disallowedTools`, so
    Claude Code must deny it outright without ever prompting — the script asserts exit code
-   `0` and greps the transcript (`read e2e -n 60`, with the prompt-echo line filtered out) to
-   confirm the command's output never actually appears, i.e. it did not run.
+   `0` and checks the transcript (`read e2e -n 80`) for actual evidence of execution (a line
+   matching `^\s*⏺ Bash\(` — a Bash tool-use — or `^\s*⎿\s+hello-from-e2e` — its output
+   block), not a plain substring match, since Claude's own refusal prose quotes the command
+   text back and would otherwise false-positive.
 6. Opens a second session (`e2e2`) in **default** mode — no `--read-only` — to confirm the
    *other* half of the permission story: here `Bash` is not denied, so `--permission-mode
    manual` must make Claude Code prompt for it. Asks it to run the same shell command; the

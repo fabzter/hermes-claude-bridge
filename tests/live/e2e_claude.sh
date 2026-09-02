@@ -10,7 +10,7 @@ cleanup() { $B watch stop >/dev/null 2>&1 || true
             HERDR_SESSION="$HERDR_BRIDGE_SESSION" herdr session stop "$HERDR_BRIDGE_SESSION" --json >/dev/null 2>&1 || true
             herdr session delete "$HERDR_BRIDGE_SESSION" --json >/dev/null 2>&1 || true
             hermes webhook remove claude-bridge-e2e >/dev/null 2>&1 || true
-            [[ -f "$CLAUDE_BRIDGE_STATE_DIR/watch.log" ]] && cp "$CLAUDE_BRIDGE_STATE_DIR/watch.log" /tmp/claude-e2e-watch.log
+            if [[ -f "$CLAUDE_BRIDGE_STATE_DIR/watch.log" ]]; then cp "$CLAUDE_BRIDGE_STATE_DIR/watch.log" /tmp/claude-e2e-watch.log || true; fi
             rm -rf "$CLAUDE_BRIDGE_STATE_DIR"; }
 trap cleanup EXIT
 echo "## webhook route (log delivery)"; $B setup-webhook --route claude-bridge-e2e --deliver log
@@ -23,8 +23,10 @@ echo "## capture fixture"; $B read e2e -n 120 > /tmp/claude_live_capture.txt
 echo "## read-only denies Bash outright (no prompt, no execution)"; set +e
 $B ask e2e "Run the shell command: echo hello-from-e2e" > /tmp/e2e-readonly-bash.out 2>&1; rc=$?; set -e; cat /tmp/e2e-readonly-bash.out
 [[ $rc == 0 ]] || { echo "FAIL: rc=$rc — expected exit 0; Bash is disallowed so this must be denied silently, not prompt or error"; exit 1; }
-transcript=$($B read e2e -n 60)
-if echo "$transcript" | grep -v "Run the shell command" | grep -q "hello-from-e2e"; then
+transcript=$($B read e2e -n 80)
+# Look for actual evidence the tool ran — a Bash tool-use line or its output block — not just
+# the command text appearing anywhere (Claude's own refusal prose quotes the command back).
+if echo "$transcript" | grep -qE '^[[:space:]]*⏺ Bash\(|^[[:space:]]*⎿[[:space:]]+hello-from-e2e'; then
   echo "FAIL: read-only session appears to have actually run the shell command"; echo "$transcript"; exit 1
 fi
 echo "confirmed: Bash denied without prompting, command did not run"
@@ -42,7 +44,7 @@ if [[ $rc == 3 ]]; then
 else
   echo "FAIL: rc=$rc — expected exit 3 (approval); default mode must prompt for Bash, not skip or auto-run it"; exit 1
 fi
-echo "## watcher log (expect a posted line)"; sleep 3; cat "$STATE/watch.log" | tail -5
+echo "## watcher log (expect a posted line)"; sleep 3; tail -5 "$STATE/watch.log" || true
 echo "## list (both sessions coexist)"; $B list
 echo "## close both"; $B close e2e; $B close e2e2; $B list; $B gc
 echo "ALL LIVE CHECKS PASSED"

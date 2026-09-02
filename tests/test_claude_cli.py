@@ -48,6 +48,18 @@ class LaunchArgTests(unittest.TestCase):
         for name in ("Bash", "Edit", "Write", "NotebookEdit", "Agent", "Workflow", "Skill", "Artifact", "Task"):
             self.assertIn(name, cli.READ_ONLY_DENIED.split(","))
 
+    def test_merge_launch_args_identity_on_either_empty_side(self):
+        # Guards _LAUNCH_FLAG_ORDER against silently dropping a flag that build_launch_args
+        # gained but merge_launch_args's flag table didn't: unioning a full build_launch_args()
+        # list with an empty list, either direction, must reproduce it exactly.
+        for read_only in (False, True):
+            for model in (None, "opus"):
+                built = cli.build_launch_args(read_only, model)
+                self.assertEqual(cli.merge_launch_args(built, []), built,
+                                  "merge_launch_args(built, []) for read_only=%r model=%r" % (read_only, model))
+                self.assertEqual(cli.merge_launch_args([], built), built,
+                                  "merge_launch_args([], built) for read_only=%r model=%r" % (read_only, model))
+
 
 class StateDirTests(unittest.TestCase):
     def test_env_override_honored(self):
@@ -182,6 +194,17 @@ class OpenAskTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertNotIn("--read-only", err)
         self.assertIn("close cv", err); self.assertIn("open cv", err)
+
+    def test_open_live_session_model_value_mismatch_lists_flag_value_pair(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent()])]})
+        store = hb.StateStore(tempfile.mkdtemp())
+        store.save("cv", launch_flags=["--permission-mode", "manual", "--model", "opus"])
+        rc, _, err, _ = run(["open", "cv", "--model", "sonnet"], h, store)
+        self.assertEqual(rc, 1)
+        self.assertIn("--model sonnet", err)
+        self.assertIn("close cv", err)
+        self.assertNotIn("Traceback", err)
 
     def test_ask_live_session_missing_only_permission_mode_no_traceback(self):
         h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
