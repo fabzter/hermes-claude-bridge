@@ -30,6 +30,14 @@ class LaunchArgTests(unittest.TestCase):
                           "--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED]
                          + cli.READ_ONLY_MCP + ["--model", "opus"])
 
+    def test_explicit_permission_mode(self):
+        self.assertEqual(cli.build_launch_args(False, None, "bypassPermissions"),
+                          ["--permission-mode", "bypassPermissions"])
+
+    def test_permission_modes_tuple(self):
+        self.assertEqual(cli.PERMISSION_MODES,
+                          ("manual", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"))
+
     def test_read_only_disables_inherited_mcp_servers(self):
         args = cli.build_launch_args(True, None)
         self.assertIn("--strict-mcp-config", args)
@@ -148,6 +156,81 @@ class OpenAskTests(unittest.TestCase):
         self.assertEqual(argv_sent.count("--model"), 1)
         self.assertEqual(argv_sent, tuple(flags_final))
         self.assertEqual(store.load("cv")["launch_flags"], flags_final)
+
+    def test_open_yolo_starts_with_bypass_permissions(self):
+        flags = cli.build_launch_args(False, None, "bypassPermissions")
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[]), ok("agent_list", agents=[]), ok("agent_list", agents=[cagent(name="y", session="C4")])],
+                       "tab create": [ok("tab_created", tab={"tab_id": "w2:t1"}, root_pane={"pane_id": "w2:p1"})],
+                       "agent start": [ok("agent_started", agent=cagent(name="y", session="C4"))],
+                       "pane get": [ok("pane_info", pane={"pane_id": "w2:p1"})],
+                       "pane process-info": [READY_SHELL,
+                           ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude"] + flags}]})]})
+        rc, out, _, store = run(["open", "y", "--yolo"], h)
+        self.assertEqual(rc, 0)
+        start = [c for c in h.calls if c[:3] == ("cli", "agent", "start")][0]
+        argv_sent = start[start.index("--") + 1:]
+        self.assertIn("--permission-mode", argv_sent)
+        self.assertIn("bypassPermissions", argv_sent)
+        self.assertEqual(store.load("y")["launch_flags"], flags)
+
+    def test_open_explicit_permission_mode_plan(self):
+        flags = cli.build_launch_args(False, None, "plan")
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[]), ok("agent_list", agents=[]), ok("agent_list", agents=[cagent(name="y", session="C6")])],
+                       "tab create": [ok("tab_created", tab={"tab_id": "w2:t1"}, root_pane={"pane_id": "w2:p1"})],
+                       "agent start": [ok("agent_started", agent=cagent(name="y", session="C6"))],
+                       "pane get": [ok("pane_info", pane={"pane_id": "w2:p1"})],
+                       "pane process-info": [READY_SHELL,
+                           ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude"] + flags}]})]})
+        rc, out, _, store = run(["open", "y", "--permission-mode", "plan"], h)
+        self.assertEqual(rc, 0)
+        start = [c for c in h.calls if c[:3] == ("cli", "agent", "start")][0]
+        argv_sent = start[start.index("--") + 1:]
+        self.assertIn("plan", argv_sent)
+        self.assertEqual(store.load("y")["launch_flags"], flags)
+
+    def test_open_read_only_with_yolo_is_usage_error(self):
+        h = FakeHerdr({})
+        rc, _, err, _ = run(["open", "ro", "--read-only", "--yolo"], h)
+        self.assertEqual(rc, 2)
+        self.assertIn("--read-only requires --permission-mode manual", err)
+
+    def test_open_yolo_conflicts_with_explicit_permission_mode(self):
+        h = FakeHerdr({})
+        rc, _, err, _ = run(["open", "y", "--yolo", "--permission-mode", "plan"], h)
+        self.assertEqual(rc, 2)
+        self.assertIn("--yolo", err)
+        self.assertIn("--permission-mode", err)
+
+    def test_ask_yolo_on_live_manual_session_refuses_before_prompt(self):
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[cagent()])]})
+        store = hb.StateStore(tempfile.mkdtemp())
+        store.save("cv", launch_flags=cli.build_launch_args(False, None))
+        rc, _, err, _ = run(["ask", "cv", "hi", "--yolo"], h, store)
+        self.assertEqual(rc, 1)
+        self.assertIn("already running", err)
+        self.assertIn("--permission-mode bypassPermissions", err)
+        self.assertFalse([c for c in h.calls if c[:3] == ("cli", "agent", "prompt")])
+
+    def test_open_after_restart_bare_open_keeps_stored_yolo(self):
+        flags = cli.build_launch_args(False, None, "bypassPermissions")
+        h = FakeHerdr({"workspace list": [ok("workspace_list", workspaces=[WS])],
+                       "agent list": [ok("agent_list", agents=[]), ok("agent_list", agents=[]), ok("agent_list", agents=[cagent(name="y", session="C5")])],
+                       "tab create": [ok("tab_created", tab={"tab_id": "w2:t1"}, root_pane={"pane_id": "w2:p1"})],
+                       "agent start": [ok("agent_started", agent=cagent(name="y", session="C5"))],
+                       "pane get": [ok("pane_info", pane={"pane_id": "w2:p1"})],
+                       "pane process-info": [READY_SHELL,
+                           ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude"] + flags}]})]})
+        store = hb.StateStore(tempfile.mkdtemp())
+        store.save("y", launch_flags=flags)
+        rc, out, _, store = run(["open", "y"], h, store)
+        self.assertEqual(rc, 0)
+        start = [c for c in h.calls if c[:3] == ("cli", "agent", "start")][0]
+        argv_sent = start[start.index("--") + 1:]
+        self.assertIn("bypassPermissions", argv_sent)
+        self.assertEqual(store.load("y")["launch_flags"], flags)
 
     def test_ask_auto_opens_then_prompts(self):
         after = "> hello\n\n⏺ hi there\n\n╭──╮\n│ ❯ │\n╰──╯\n"

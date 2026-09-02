@@ -10,10 +10,8 @@ import herdrbridge as hb
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_DIR = os.environ.get("CLAUDE_BRIDGE_STATE_DIR") or os.path.join(SKILL_DIR, "state")
-# Always pin the permission mode explicitly (rather than relying on Claude's default) so it is
-# recorded in launch_flags and check_flags can notice its loss after a herdr restore (herdr
-# relaunches with plain `claude --resume <id>`, dropping every flag we passed).
-PERMISSION_MODE_ARGS = ["--permission-mode", "manual"]
+# Claude Code 2.1.236's --permission-mode choices (verified via `claude --help`).
+PERMISSION_MODES = ("manual", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions")
 READ_ONLY_ALLOWED = "Read,Grep,Glob,WebSearch,WebFetch"
 # Bash/Edit/Write/NotebookEdit are the obvious file/shell escapes; Agent/Workflow/Skill/Artifact
 # are built-in tools that can themselves invoke further tools (including Bash-equivalents), so
@@ -35,8 +33,11 @@ def default_bridge_factory():
     return hb.Bridge(hb.Herdr(hb.session_name(), bin=herdr_bin()), CLAUDE_CFG, hb.StateStore(STATE_DIR))
 
 
-def build_launch_args(read_only: bool, model: str | None) -> list:
-    args = list(PERMISSION_MODE_ARGS)
+def build_launch_args(read_only: bool, model: str | None, permission_mode: str = "manual") -> list:
+    # Always pin the permission mode explicitly (rather than relying on Claude's default) so it is
+    # recorded in launch_flags and check_flags can notice its loss after a herdr restore (herdr
+    # relaunches with plain `claude --resume <id>`, dropping every flag we passed).
+    args = ["--permission-mode", permission_mode]
     if read_only:
         args += ["--allowedTools", READ_ONLY_ALLOWED, "--disallowedTools", READ_ONLY_DENIED] + READ_ONLY_MCP
     if model:
@@ -112,10 +113,11 @@ def check_flags(bridge: hb.Bridge, name: str, agent: dict) -> None:
             % (name, " ".join(stored), name, name, suffix), hb.EXIT_ERROR)
 
 
-def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, model: str | None, fresh: bool) -> dict:
+def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, model: str | None, fresh: bool,
+                 permission_mode: str = "manual") -> dict:
     kind, _ = bridge.resolve(name)
     if kind == "live":
-        requested = build_launch_args(read_only, model)
+        requested = build_launch_args(read_only, model, permission_mode)
         stored = bridge.store.load(name).get("launch_flags") or []
         # Compare flag-by-flag (value included), not token-by-token: a stored --model with a
         # different value must count as a mismatch even though the bare token "--model" is
@@ -152,8 +154,17 @@ def ensure_open(bridge: hb.Bridge, name: str, cwd: str | None, read_only: bool, 
         # was stored before, flag/value-aware, so a caller who only passes --model doesn't
         # silently drop previously-requested --read-only limits, and re-requesting a flag with a
         # new value (e.g. a different --model) replaces it instead of appending a duplicate.
-        requested = build_launch_args(read_only, model)
+        requested = build_launch_args(read_only, model, permission_mode)
         stored = bridge.store.load(name).get("launch_flags") or []
+        if permission_mode == "manual" and "--permission-mode" in _parse_launch_pairs(stored):
+            # `permission_mode` here is ensure_open's own ambient default, not a real ask — main()
+            # only passes a non-"manual" value when the caller actually typed --yolo/
+            # --permission-mode. Don't let that ambient default silently downgrade a mode already
+            # granted and stored on a previous `open`/`ask --yolo`; strip the pinned pair from
+            # `requested` so merge_launch_args falls through to the stored value below, exactly
+            # like an unspecified --model or --read-only already does. An explicit non-manual ask
+            # (a different value) is left in place and overrides stored, same as --model.
+            requested = requested[2:]  # build_launch_args always emits the pair first
         flags = merge_launch_args(stored, requested)
         agent = bridge.start(name, flags, fresh=fresh, cwd=cwd)
         bridge.store.save(name, launch_flags=flags)
@@ -170,16 +181,26 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("name", help="session NAME ([a-z][a-z0-9_-]{0,31}); one per topic/repo")
         return sp
 
+    def add_permission_args(sp):
+        sp.add_argument("--permission-mode", choices=PERMISSION_MODES, default="manual",
+                         help="Claude's --permission-mode; only change this when the user "
+                              "explicitly asked for that autonomy for this session")
+        sp.add_argument("--yolo", action="store_true",
+                         help="alias for --permission-mode bypassPermissions; only when the user "
+                              "explicitly asked for that autonomy for this session")
+
     sp = named("open", "open (or resume) a Claude session in a herdr pane")
     sp.add_argument("--cwd", help="directory Claude works in (default: $HOME or the stored one)")
     sp.add_argument("--read-only", action="store_true", help="allow only Read/Grep/Glob/WebSearch/WebFetch")
     sp.add_argument("--model", help="Claude model name")
+    add_permission_args(sp)
     sp.add_argument("--fresh", action="store_true", help="start a new conversation instead of resuming")
     sp = named("ask", "send a message (auto-opens), wait, print Claude's reply")
     sp.add_argument("text", nargs="?", help="message; '-' reads stdin")
     sp.add_argument("-f", "--file", help="read the message from FILE")
     sp.add_argument("--timeout", type=int, default=600)
     sp.add_argument("--cwd"); sp.add_argument("--read-only", action="store_true"); sp.add_argument("--model")
+    add_permission_args(sp)
     named("state", "print idle|busy|approval|secret|clarify|blocked|unknown|dead|missing")
     sp = named("read", "print recent transcript text")
     sp.add_argument("-n", "--lines", type=int, default=120)
@@ -216,6 +237,21 @@ def _text(args) -> str:
     return text
 
 
+def _resolve_permission_mode(args) -> str:
+    """Combine open/ask's --permission-mode and --yolo into the single mode ensure_open needs,
+    enforcing the documented conflicts up front (before any herdr call is made)."""
+    mode = args.permission_mode
+    if args.yolo:
+        if mode not in (None, "manual"):
+            raise hb.UsageError(
+                "--yolo conflicts with --permission-mode %s (use one or the other)" % mode)
+        mode = "bypassPermissions"
+    mode = mode or "manual"
+    if args.read_only and mode != "manual":
+        raise hb.UsageError("--read-only requires --permission-mode manual")
+    return mode
+
+
 def main(argv=None, bridge_factory=None, stdout=None, stderr=None) -> int:
     out, err = stdout or sys.stdout, stderr or sys.stderr
     try:
@@ -223,6 +259,8 @@ def main(argv=None, bridge_factory=None, stdout=None, stderr=None) -> int:
     except SystemExit as e:
         return 2 if e.code else 0
     try:
+        if args.cmd in ("open", "ask"):
+            permission_mode = _resolve_permission_mode(args)
         if args.cmd == "watch":
             import claude_bridge_watch as w
             return w.command(args.action, STATE_DIR, bridge_factory or default_bridge_factory, out, err)
@@ -243,13 +281,13 @@ def main(argv=None, bridge_factory=None, stdout=None, stderr=None) -> int:
             return 0
         name = hb.validate_name(args.name)
         if args.cmd == "open":
-            a = ensure_open(b, name, args.cwd, args.read_only, args.model, args.fresh)
+            a = ensure_open(b, name, args.cwd, args.read_only, args.model, args.fresh, permission_mode)
             st = b.state(name)[0]
             out.write("%s %s %s\n" % (name, a.get("pane_id"), st))
             return 0 if st in ("idle", "busy") else hb.state_exit(st)
         if args.cmd == "ask":
             text = _text(args)
-            a = ensure_open(b, name, args.cwd, args.read_only, args.model, False)
+            a = ensure_open(b, name, args.cwd, args.read_only, args.model, False, permission_mode)
             state, reply, truncated, dialog = b.send(name, text, args.timeout * 1000)
             out.write(reply + ("\n" if reply and not reply.endswith("\n") else ""))
             if truncated:
