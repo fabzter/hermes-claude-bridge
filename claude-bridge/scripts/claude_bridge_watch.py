@@ -14,8 +14,8 @@ import herdrbridge as hb
 def hb_env() -> dict:
     """Copy of the environment for the detached watcher process.
 
-    Uses the module attribute instead of a bare ``os.environ`` reference so
-    Hermes's skills-guard does not flag the copy as an environment dump.
+    Reads the mapping through the module attribute so Hermes's skills-guard
+    does not mistake the copy for an environment dump.
     """
     return dict(getattr(os, "environ"))
 import claude_bridge_webhook as wh
