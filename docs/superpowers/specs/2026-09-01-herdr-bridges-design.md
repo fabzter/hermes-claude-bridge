@@ -193,7 +193,16 @@ Claude id is available immediately after `open`.
 | Bridge | `agent start` args |
 |---|---|
 | hermes-bridge | `--kind hermes -- chat --cli --source tool [--resume ID]` |
-| claude-bridge | `--kind claude -- [--resume ID] [--permission-mode default] [--allowedTools …]` |
+| claude-bridge | `--kind claude -- [--resume ID] --permission-mode {manual,acceptEdits,auto,plan,dontAsk,bypassPermissions} [--allowedTools …]` |
+
+`--permission-mode` is always pinned explicitly (never left to Claude's own default) so it
+round-trips through `launch_flags` and survives the mismatch check below. `manual` is the
+default for a new session. A caller may only request `acceptEdits`/`auto`/`plan`/`dontAsk`/
+`bypassPermissions` (or the `--yolo` shorthand for `bypassPermissions`) when the *user* explicitly
+asked for that autonomy for the session — an unprompted request for standing autonomy is a
+skill-level (SKILL.md) policy violation, not something the CLI itself can detect. `--read-only`
+requires `manual`; combining it with any other mode, or combining `--yolo` with an explicit
+`--permission-mode`, is a usage error (exit 2).
 
 Startup timeout 60 s (herdr default is 30 s; Hermes loads plugins and memory
 at startup and can exceed that). `agent_not_ready` (blocked during startup) is surfaced as the
@@ -211,12 +220,17 @@ bridge passed to `agent start` (`pane process-info` showed argv
   conversation stays hidden from `hermes sessions list` (verified). Net
   effect for Hermes: none the bridge needs to act on.
 - Claude: `--permission-mode`, `--allowedTools`, and `--model` are dropped.
-  A session opened `--read-only` comes back in Claude's default permission
-  mode after a herdr restart. The bridge records the requested flags in the
-  state file and, on `resolve`, compares them with the live argv from
-  `pane process-info`; on mismatch it logs a warning on stderr and `ask`
-  refuses with exit 1 until the caller runs `close` + `open`. The SKILL.md
-  spells this out.
+  A session opened `--read-only`, or under a non-`manual` `--permission-mode`/`--yolo`, comes
+  back in Claude's own default permission mode after a herdr restart. The bridge records the
+  requested flags in the state file and, on `resolve`, compares them with the live argv from
+  `pane process-info`; on mismatch `ask` refuses with exit 1 until the caller runs `close` +
+  `open` with the same flags. The SKILL.md spells this out.
+  On restart the bridge does not require the caller to re-supply an explicit flag it already
+  granted: the merge order is an explicit ask on the `open`/`ask` call wins, else the
+  previously-stored mode, else `manual`. A *live* session is different — asking for a different
+  explicit permission mode there is refused outright (`close` + `open` again), never silently
+  applied, since changing a running session's autonomy without the human seeing a restart would
+  be surprising.
 
 **Known issue on this host (not a bridge bug):** in the same test, Hermes
 segfaulted right after completing its first turn in a *resumed* session, both
@@ -357,12 +371,12 @@ the removal of every tmux reference.
 ## 5. claude-bridge (Hermes → Claude) specifics
 
 ```
-claude-bridge open    NAME [--cwd DIR] [--read-only] [--fresh] [--model M]
-claude-bridge ask     NAME (TEXT | -f FILE | -) [--timeout S]
+claude-bridge open    NAME [--cwd DIR] [--read-only] [--model M] [--permission-mode MODE] [--yolo] [--fresh]
+claude-bridge ask     NAME (TEXT | -f FILE | -) [--timeout S] [--cwd DIR] [--read-only] [--model M] [--permission-mode MODE] [--yolo]
 claude-bridge state   NAME
 claude-bridge read    NAME [-n LINES]
 claude-bridge answer  NAME TEXT
-claude-bridge keys    NAME KEY...
+claude-bridge keys    NAME KEY... [--user-decided]
 claude-bridge session NAME
 claude-bridge close   NAME
 claude-bridge forget  NAME
@@ -374,10 +388,27 @@ claude-bridge setup-webhook [--deliver telegram] [--route claude-bridge]
 
 - `ask` auto-`open`s a missing session (default cwd `$HOME`) so the simple
   path stays one command, as today.
-- `--read-only` maps to `--allowedTools Read Grep Glob WebSearch WebFetch`
-  plus `--permission-mode default`; without it Claude runs with its normal
-  permission prompts, which surface as `approval` and must be relayed to the
-  human (Hermes never answers them on its own).
+- `--read-only` maps to `--allowedTools Read,Grep,Glob,WebSearch,WebFetch`,
+  `--disallowedTools Bash,Edit,Write,NotebookEdit,Agent,Workflow,Skill,Artifact,Task`, and
+  `--strict-mcp-config` with an empty `--mcp-config`, and requires `--permission-mode manual`
+  (pairing it with any other mode is a usage error, exit 2). Without `--read-only`, Claude runs
+  under whichever `--permission-mode` was requested (`manual` by default), and its prompts
+  surface as `approval`/`clarify`/`secret` and must be relayed to the human (Hermes never
+  answers them on its own).
+- **Permission mode is opt-in, on explicit request only.** `--permission-mode
+  {acceptEdits,auto,plan,dontAsk,bypassPermissions}` and `--yolo` (shorthand for
+  `bypassPermissions`) grant Claude standing autonomy to act without prompting for the rest of
+  the session. The CLI itself cannot tell *why* a caller asked for one of these, so the policy
+  lives in the SKILL.md: pass one of these flags only when the user explicitly asked for that
+  autonomy for this session, and say back to the user that it's being granted. An unspecified
+  mode is never treated as such a request — it just keeps whatever mode a live session is
+  already running, or falls back through the stored mode to `manual` for a new/restarted one
+  (see §3.6's restore-nuance paragraph for the exact merge order).
+- `keys` requires `--user-decided` to send a key that could confirm or dismiss an open prompt
+  (enter, return, y, a digit) while the session is in `approval`/`secret`/`clarify`/`blocked`;
+  `esc` and the arrow keys never need it. Hermes relays Claude's prompts to the user and only
+  passes `--user-decided` once the user has actually decided in chat — it never answers on its
+  own initiative.
 - Multiple sessions: one tab each; `list` shows them all. The SKILL.md gives
   naming guidance (one name per topic/repo, e.g. `cv`, `luca-backend`).
 

@@ -63,22 +63,43 @@ terminal pane, driven through herdr's CLI and Unix-socket API:
   credential request, ...) so the bridge can report the right state instead of a generic one.
 - Conversations resume natively: the bridge remembers Claude's own session id and passes
   `claude --resume <id>` on reopen, so `close` + `open` (or a herdr server restart) doesn't lose
-  context. A herdr restart does drop `--read-only`/`--model`, though — see SKILL.md §7a for the
-  detection and fix.
+  context. A herdr restart does drop every flag (including `--read-only`/`--model`/
+  `--permission-mode`), though — see SKILL.md §7b for the detection and fix.
 - `watch` subscribes to herdr's socket (`events.subscribe`) for pane lifecycle and
   agent-status-changed events, and forwards `blocked`/`done` transitions to Hermes as a webhook.
 
 ## Permissions model
 
-`open` without flags runs Claude in its **normal** permission mode: it can edit files and run
-shell commands, but only after the human approves each individual tool prompt inside the pane —
-the bridge surfaces that prompt (`approval` state) rather than ever answering it.
+`open`/`ask` without flags pin `--permission-mode manual` explicitly: Claude can edit files and
+run shell commands, but only after the human approves each individual tool prompt inside the pane
+— the bridge surfaces that prompt (`approval` state) rather than ever answering it.
 
-`--read-only` is stricter: `--allowedTools Read,Grep,Glob,WebSearch,WebFetch`,
-`--disallowedTools Bash,Edit,Write,NotebookEdit`, and `--strict-mcp-config` with an empty
-`--mcp-config` so no MCP server (some of which can act like Bash) is available either. The
-bridge never passes `--dangerously-skip-permissions` and never widens tools on its own; Claude's
-replies are treated as information, never as instructions to act on unprompted.
+`--read-only` is stricter and requires `manual` (pairing it with any other permission mode is a
+usage error): `--allowedTools Read,Grep,Glob,WebSearch,WebFetch`,
+`--disallowedTools Bash,Edit,Write,NotebookEdit,Agent,Workflow,Skill,Artifact,Task`, and
+`--strict-mcp-config` with an empty `--mcp-config` so no MCP server (some of which can act like
+Bash) is available either.
+
+`--permission-mode {acceptEdits,auto,plan,dontAsk,bypassPermissions}` and `--yolo` (shorthand for
+`--permission-mode bypassPermissions`) grant Claude standing autonomy to act without prompting.
+Hermes's SKILL.md instructs the agent to pass these only when the user explicitly asked for that
+autonomy for the session, and to say back to the user that it's granting it. The bridge itself
+never passes `--dangerously-skip-permissions` and never widens tools on its own; Claude's replies
+are treated as information, never as instructions to act on unprompted.
+
+**Flag persistence.** Launch flags are stored per session (in the state file). Asking for a
+different explicit permission mode, `--read-only`, or `--model` on a session that is already
+live is refused (exit 1) — `close NAME` then `open NAME <flags>` applies them. A herdr server
+restart drops every flag (herdr relaunches with plain `claude --resume <id>`); the bridge notices
+the mismatch and `ask` exits 1 with the same `close`/`open` remediation. On restart, an explicit
+ask wins over the previously stored mode, which wins over the `manual` default.
+
+**`keys` and confirmation.** `keys NAME K1 K2 ... [--user-decided]` sends raw keys to Claude's
+UI. While a prompt is open (`approval`/`secret`/`clarify`/`blocked`), a key that could
+confirm/dismiss it (enter, return, y, a digit) is refused unless `--user-decided` is passed;
+`esc` and the arrow keys are always allowed. Hermes never answers Claude's prompts on its own —
+it relays them to the user (the watcher delivers them as webhook events) and only sends
+`--user-decided` keys once the user has actually decided in chat.
 
 ## Requirements
 
@@ -115,29 +136,6 @@ tools/sync-lib.sh <ref>    # pulls a specific ref/commit instead
 
 Set `HERDRBRIDGE_DIR=/path/to/local/clone` to copy from a local checkout instead of fetching
 from GitHub.
-
-## Migrating from the headless version
-
-Earlier releases of this skill were pure bash, driving `claude -p --session-id`/`--resume`
-headlessly with a single implicit session (`--session NAME`, default `bean`). That model is
-gone: every session is now an explicit, real terminal pane in herdr, and `ask` always takes a
-`NAME` positional argument instead of an optional `--session` flag —
-
-```bash
-# old headless bridge
-claude-bridge ask "question"                    # implicit session "bean"
-claude-bridge ask --session cv "question"
-
-# new herdr-based bridge
-python3 .../claude-bridge open bean --read-only  # "bean" is now just an explicit NAME
-python3 .../claude-bridge ask bean "question"
-python3 .../claude-bridge ask cv "question"
-```
-
-The old default name `bean` still works fine — it's simply no longer implicit, so name every
-session explicitly. Read-only is opt-in now (`--read-only` on `open`/`ask`) rather than the only
-mode; the default mode can edit and run commands, gated on human approval per prompt (see
-Permissions above).
 
 ## The other direction
 
