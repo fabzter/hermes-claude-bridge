@@ -21,6 +21,10 @@ hermes skills update
 If the hub index is stale and `update` reports "up to date" without picking up a new release,
 re-run the `install ... --yes` command above — it reinstalls unconditionally.
 
+Note: `claude-bridge/SKILL.md` must keep its relative `scripts/...` references, since Hermes's
+hub installer only ships a support directory that SKILL.md mentions that way — dropping them
+silently installs `SKILL.md` alone, without `scripts/`.
+
 ## Usage
 
 Always invoke via `python3` (the Hermes skill installer copies files verbatim and does not

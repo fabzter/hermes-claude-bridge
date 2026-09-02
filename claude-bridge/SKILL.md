@@ -34,6 +34,11 @@ Always invoke via `python3` (the hub installer drops the executable bit):
 python3 ~/.hermes/skills/claude-bridge/scripts/claude-bridge <cmd> ...
 ```
 
+Files in this skill: `scripts/claude-bridge` (launcher), `scripts/claude_bridge_cli.py`,
+`scripts/claude_bridge_webhook.py`, `scripts/claude_bridge_watch.py`, `scripts/herdrbridge.py`
+(vendored library), `scripts/herdrbridge.version`. These are relative paths on purpose — Hermes's
+installer only ships a support directory that SKILL.md references that way.
+
 | Requirement | Why | If missing |
 |---|---|---|
 | `python3` | runs the CLI | already required by Hermes itself |
