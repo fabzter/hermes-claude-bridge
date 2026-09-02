@@ -47,6 +47,7 @@ class OpenAskTests(unittest.TestCase):
                        "agent list": [ok("agent_list", agents=[]), ok("agent_list", agents=[]), ok("agent_list", agents=[cagent(session="C1")])],
                        "tab create": [ok("tab_created", tab={"tab_id": "w2:t1"}, root_pane={"pane_id": "w2:p1"})],
                        "agent start": [ok("agent_started", agent=cagent(session="C1"))],
+                       "pane get": [ok("pane_info", pane={"pane_id": "w2:p1"})],
                        "pane process-info": [READY_SHELL,
                            ok("pane_process_info", process_info={"foreground_processes": [{"name": "node", "argv": ["node", "/x/claude", "--allowedTools", cli.READ_ONLY_ALLOWED, "--disallowedTools", cli.READ_ONLY_DENIED] + cli.READ_ONLY_MCP}]})]})
         rc, out, _, store = run(["open", "cv", "--cwd", "/tmp", "--read-only"], h)
@@ -67,6 +68,7 @@ class OpenAskTests(unittest.TestCase):
                        "tab create": [ok("tab_created", tab={"tab_id": "w2:t1"}, root_pane={"pane_id": "w2:p1"})],
                        "agent start": [ok("agent_started", agent=cagent())],
                        "agent prompt": [ok("agent_prompt", agent=cagent())],
+                       "pane get": [ok("pane_info", pane={"pane_id": "w2:p1"})],
                        "pane process-info": [READY_SHELL]},
                       {"agent read": ["", after]})
         rc, out, _, _ = run(["ask", "cv", "hello"], h)
